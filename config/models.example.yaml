@@ -5,21 +5,28 @@
 # Only one GPU "family" is resident at a time: starting a vLLM model unloads Ollama models, and using an
 # Ollama model stops the resident vLLM container (both refuse while agents on the other side are running).
 #
+# scripts/setup.sh copies this file to config/models.yaml (gitignored); edit that copy for your machine.
+# The vLLM entries are tuned for an NVIDIA GB10 / DGX Spark-class box (128 GB unified memory, sm_121):
+# adjust --gpu-memory-utilization / --kv-cache-memory-bytes / --max-num-seqs for your GPU.
+#
 # Paths below are HOST paths (the launcher hands them to the Docker daemon).
 
 paths:
-  models_dir: /home/ascent/Projects/Self-Hosted-AI/models
-  vllm_cache: /home/ascent/Projects/Self-Hosted-AI/vllm-cache
+  models_dir: /srv/models          # vLLM weights: <models_dir>/<name> is mounted at /models/<name>
+  vllm_cache: /srv/vllm-cache      # torch.compile / kernel cache (speeds up later loads)
 
-default_model: nemotron-3.5-bolt
+default_model: nemotron-3.5-lightning
 
 models:
   nemotron-3.5-bolt:
     backend: vllm
-    description: "Nemotron-3.5-Bolt 74B-A9B (IQ2 QAD) + DFlash drafter. Best local quality (10/18 fresh-PR)."
+    description: "Nemotron-3.5-Bolt 74B-A9B (IQ2 QAD) + DFlash drafter. Best local quality in our tests."
     max_agents: 8          # concurrent delegate_task runs (vLLM --max-num-seqs below)
     port: 9110
-    image: self-hosted-ai/vllm-bolt:local
+    # A vLLM nightly with NVIDIA's Bolt additions (b12x kernels, ultra_v3 reasoning-parser plugin at
+    # /opt/bolt/), built following NVIDIA's Nemotron 3.5 Bolt serving recipe. PIECEWISE CUDA graphs are
+    # required for --max-num-seqs > 1 (full graphs segfaulted at batch 8 in our tests).
+    image: vllm-bolt:local
     entrypoint: [vllm]
     ipc_host: true
     memory: 100g

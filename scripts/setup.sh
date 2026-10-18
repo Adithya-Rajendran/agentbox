@@ -17,6 +17,7 @@ if [ ! -f .env ]; then
   chmod 600 .env
   echo "wrote .env"
 fi
+[ -f config/models.yaml ] || { cp config/models.example.yaml config/models.yaml; echo "wrote config/models.yaml (edit paths/models for your machine)"; }
 set -a; . ./.env; set +a
 if getent passwd "$AGENTBOX_AGENT_UID" >/dev/null; then
   echo "warning: agent uid $AGENTBOX_AGENT_UID exists on this host ($(getent passwd "$AGENTBOX_AGENT_UID" | cut -d: -f1)); pick an unused one" >&2

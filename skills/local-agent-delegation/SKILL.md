@@ -1,12 +1,12 @@
 ---
 name: local-agent-delegation
-description: How to hand coding work to the LOCAL model agents on the GX10 (the delegate_task MCP tool — Nemotron-3.5-Bolt / Ornith running Claude Code in a hardened, network-less container) and get correct results back. Use this whenever you are about to call delegate_task, plan work for "the local agent/model/worker", act as planner/reviewer for a local executor, review or merge an agent/<id> branch, or decide whether a task should go to a local model vs. a Claude subagent — even if the user just says "have the local model do it", "delegate this", or "use the GB10 for the implementation".
+description: How to hand coding work to LOCAL model agents through agentbox (the delegate_task MCP tool — an open-weight model served by vLLM or Ollama, running Claude Code in a hardened, network-less container) and get correct results back. Use this whenever you are about to call delegate_task, plan work for "the local agent/model/worker", act as planner/reviewer for a local executor, review or merge an agent/<id> branch, or decide whether a task should go to a local model vs. a Claude subagent — even if the user just says "have the local model do it", "delegate this", or "use the local box for the implementation".
 ---
 
 # Delegating to the local agents
 
 You are the planner and reviewer; a local open-weight model is the executor. It runs Claude Code headless
-inside a hardened container on the GX10 (no network, scratch clone of the repo) and returns its work as a
+inside a hardened container on the local machine (no network, scratch clone of the repo) and returns its work as a
 branch `agent/<id>`. On real-world bug-fix benchmarks the best local executor resolves about as many issues as
 a small Claude model working from the bare issue text — but it fails in specific, repeatable ways, and almost
 every failure is a **spec or verification gap that the planner could have closed**. This skill is about
@@ -103,9 +103,9 @@ the tests they wrote.
 ## 6. When things go wrong
 
 - Timeouts or very long runs → task too big or under-pointed; split it or add file/function pointers.
-- `harness_error`, empty report, or the model "disappeared" → check whether the box stopped the model for
-  memory: `tail /var/log/gb10-mem/actions.log` (gb10-memguard) and `journalctl -u earlyoom`. Don't retry in a
-  loop if memguard fired — something else is using GPU memory.
+- `harness_error`, empty report, or the model "disappeared" → check whether the host killed the model for
+  memory (kernel OOM killer, earlyoom, or any GPU-memory guard you run: `journalctl -k`, `journalctl -u earlyoom`).
+  Don't retry in a loop if it did — something else is using GPU memory.
 - A delegation that sits idle for ~3–4 min at the start → the model server is loading the model; normal.
 - `error` mentioning the launcher or a backend that "exited during load" → `docker logs agentbox-launcher`,
   `journalctl -t agentbox-<model>`.

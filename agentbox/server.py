@@ -70,7 +70,7 @@ async def _git(*args: str, **kw) -> str:
 server = MCPServer(
     name="local-agents",
     instructions=(
-        "delegate_task runs a coding task on a LOCAL open-weight model (vLLM or Ollama on the GB10) inside a "
+        "delegate_task runs a coding task on a LOCAL open-weight model (vLLM or Ollama on this machine) inside a "
         "sandboxed container with no network, on an isolated clone (returned as branch agent/<id>). Use it for "
         "well-specified execution work after you've planned. Give a precise, self-contained spec: files, "
         "expected behaviour, how to verify. Review the returned diff, then merge the branch or re-delegate "
