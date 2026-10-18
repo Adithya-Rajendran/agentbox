@@ -1,0 +1,68 @@
+# agentbox model registry. Two backend kinds:
+#   vllm   - the launcher starts/stops a dedicated vLLM container on demand (one resident at a time,
+#            never swapped out from under a running agent). Must serve Anthropic /v1/messages natively.
+#   ollama - served by the long-running `ollama` compose service (pulled on first use).
+# Only one GPU "family" is resident at a time: starting a vLLM model unloads Ollama models, and using an
+# Ollama model stops the resident vLLM container (both refuse while agents on the other side are running).
+#
+# Paths below are HOST paths (the launcher hands them to the Docker daemon).
+
+paths:
+  models_dir: /home/ascent/Projects/Self-Hosted-AI/models
+  vllm_cache: /home/ascent/Projects/Self-Hosted-AI/vllm-cache
+
+default_model: nemotron-3.5-bolt
+
+models:
+  nemotron-3.5-bolt:
+    backend: vllm
+    description: "Nemotron-3.5-Bolt 74B-A9B (IQ2 QAD) + DFlash drafter. Best local quality (10/18 fresh-PR)."
+    max_agents: 8          # concurrent delegate_task runs (vLLM --max-num-seqs below)
+    port: 9110
+    image: self-hosted-ai/vllm-bolt:local
+    entrypoint: [vllm]
+    ipc_host: true
+    memory: 100g
+    load_timeout_s: 1800
+    env:
+      VLLM_USE_V2_MODEL_RUNNER: "1"
+      VLLM_CACHE_ROOT: /cache
+    args: >-
+      serve /models/nemotron-3.5-bolt --served-model-name nemotron-3.5-bolt
+      --host 127.0.0.1 --port 9110 --trust-remote-code --load-format auto
+      --max-model-len 131072 --max-num-seqs 8 --enable-chunked-prefill
+      --compilation-config {"cudagraph_mode":"PIECEWISE"}
+      --gpu-memory-utilization 0.55 --kv-cache-memory-bytes 20000000000 --kv-cache-dtype fp8
+      --linear-backend b12x --moe-backend b12x --attention-backend FLASHINFER --mamba-backend flashinfer
+      --mamba-ssm-cache-dtype bfloat16 --mamba-cache-dtype bfloat16 --mamba-cache-mode align --seed 42
+      --limit-mm-per-prompt {"video":0,"image":0}
+      --enable-auto-tool-choice --tool-call-parser qwen3_coder
+      --reasoning-parser-plugin /opt/bolt/ultra_v3_reasoning_parser.py --reasoning-parser ultra_v3
+      --speculative-config {"method":"dflash","model":"/models/nemotron-3.5-bolt-lilicorr","num_speculative_tokens":7,"rejection_sample_method":"standard","attention_backend":"FLASHINFER","draft_load_config":{"load_format":"auto"}}
+
+  ornith-1.5-35b:
+    backend: vllm
+    description: "Ornith-1.5 35B-A3B NVFP4 + MTP. Lower quality, many concurrent sequences: fan-out."
+    max_agents: 16
+    port: 9111
+    image: nvcr.io/nvidia/vllm:26.09-py3
+    entrypoint: [vllm]
+    shm_size: 16g
+    memory: 100g
+    load_timeout_s: 1800
+    env:
+      VLLM_USE_V2_MODEL_RUNNER: "0"
+      VLLM_CACHE_ROOT: /cache
+    args: >-
+      serve /models/ornith-1.5-35b --served-model-name ornith-1.5-35b
+      --host 127.0.0.1 --port 9111 --max-model-len 131072 --gpu-memory-utilization 0.60
+      --kv-cache-memory-bytes 40000000000 --max-num-seqs 32 --quantization modelopt --moe-backend marlin
+      --kv-cache-dtype fp8 --enable-prefix-caching
+      --speculative-config {"method":"mtp","num_speculative_tokens":1,"moe_backend":"triton"}
+      --enable-auto-tool-choice --tool-call-parser qwen3_xml --reasoning-parser qwen3 --language-model-only
+
+  nemotron-3.5-lightning:
+    backend: ollama
+    description: "Nemotron-3.5-Lightning 30B-A3B via Ollama (~25 GB). Agent-tuned; no vLLM load wait; pulled on first use."
+    ollama_model: nemotron-3.5-lightning:30b
+    max_agents: 4          # keep <= OLLAMA_NUM_PARALLEL

@@ -1,0 +1,103 @@
+# agentbox - local coding agents behind an MCP server. Localhost-only.
+#
+#   ollama            model server (always on, loads models on demand)          127.0.0.1:11434
+#   agentbox          MCP server (unprivileged, streamable HTTP + bearer token)  127.0.0.1:8765/mcp
+#   agentbox-launcher the ONLY container with the Docker socket; starts hardened agent containers
+#                     (--network none) and on-demand vLLM backends from config/models.yaml
+#
+# Host directories are mounted at the SAME path inside the containers, so a path means the same thing
+# to the MCP server, the launcher and the Docker daemon. Run scripts/setup.sh once (writes .env, creates dirs).
+
+x-logging: &bounded-logs
+  driver: json-file
+  options: { max-size: "50m", max-file: "3", compress: "true" }
+
+x-hardened: &hardened
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  logging: *bounded-logs
+  restart: unless-stopped
+  user: "${AGENTBOX_UID:?set AGENTBOX_UID}:${AGENTBOX_GID:?set AGENTBOX_GID}"
+
+x-env: &agentbox-env
+  AGENTBOX_DATA: ${AGENTBOX_DATA:?set AGENTBOX_DATA (absolute path)}
+  AGENTBOX_REPOS_ROOT: ${AGENTBOX_REPOS_ROOT:?set AGENTBOX_REPOS_ROOT (absolute path)}
+  AGENTBOX_VENVS: ${AGENTBOX_VENVS:?set AGENTBOX_VENVS (absolute path)}
+  AGENTBOX_UID: ${AGENTBOX_UID}
+  AGENTBOX_GID: ${AGENTBOX_GID}
+  AGENTBOX_AGENT_UID: ${AGENTBOX_AGENT_UID:-64000}
+  AGENTBOX_AGENT_GID: ${AGENTBOX_AGENT_GID:-64000}
+  AGENTBOX_AGENT_IMAGE: agentbox/agent:local
+  AGENTBOX_AGENT_RUNTIME: ${AGENTBOX_AGENT_RUNTIME:-}
+  AGENTBOX_LAUNCHER_SOCK: /run/agentbox/launcher.sock
+  AGENTBOX_MODELS: /etc/agentbox-config/models.yaml
+  AGENTBOX_EXCLUDES: /etc/agentbox-config/agent-gitignore
+
+services:
+  ollama:
+    <<: *hardened
+    image: ollama/ollama:0.40.5
+    container_name: ollama
+    network_mode: host
+    gpus: all
+    environment:
+      OLLAMA_HOST: 127.0.0.1:11434
+      OLLAMA_MODELS: /models
+      HOME: /tmp
+      OLLAMA_CONTEXT_LENGTH: "65536"     # Claude Code's system prompt + tools alone are ~20k tokens
+      OLLAMA_NUM_PARALLEL: "4"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_KEEP_ALIVE: 30m
+      OLLAMA_FLASH_ATTENTION: "1"
+      OLLAMA_KV_CACHE_TYPE: q8_0
+    tmpfs: ["/tmp:size=1g"]
+    volumes:
+      - ${OLLAMA_MODELS_DIR:-${AGENTBOX_DATA}/ollama}:/models
+
+  agentbox-launcher:
+    <<: *hardened
+    build: .
+    image: agentbox/server:local
+    container_name: agentbox-launcher
+    command: ["agentbox.launcher"]
+    network_mode: none                   # talks only to the Docker socket and its own unix socket
+    group_add: ["${DOCKER_GID:?set DOCKER_GID (getent group docker)}"]
+    pids_limit: 128
+    mem_limit: 256m
+    environment: *agentbox-env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${AGENTBOX_DATA}/run:/run/agentbox
+      - ./config:/etc/agentbox-config:ro           # dir mount: edits apply on restart
+      # read-only views, only to validate paths before handing them to the Docker daemon
+      - ${AGENTBOX_DATA}:${AGENTBOX_DATA}:ro
+      - ${AGENTBOX_REPOS_ROOT}:${AGENTBOX_REPOS_ROOT}:ro
+      - ${AGENTBOX_VENVS}:${AGENTBOX_VENVS}:ro
+
+  agentbox:
+    <<: *hardened
+    image: agentbox/server:local
+    container_name: agentbox
+    command: ["agentbox.server"]
+    network_mode: host                   # reaches 127.0.0.1 model servers; serves MCP on 127.0.0.1 only
+    pids_limit: 512
+    mem_limit: 2g
+    tmpfs: ["/tmp:size=512m"]
+    environment:
+      <<: *agentbox-env
+      AGENTBOX_MCP_TOKEN: ${AGENTBOX_MCP_TOKEN:?set AGENTBOX_MCP_TOKEN in .env}
+      AGENTBOX_HOST: 127.0.0.1
+      AGENTBOX_PORT: ${AGENTBOX_PORT:-8765}
+    volumes:
+      - ${AGENTBOX_REPOS_ROOT}:${AGENTBOX_REPOS_ROOT}
+      - ${AGENTBOX_DATA}:${AGENTBOX_DATA}
+      - ${AGENTBOX_DATA}/run:/run/agentbox
+      - ./config:/etc/agentbox-config:ro
+    depends_on: [agentbox-launcher, ollama]
+
+  # Agent image (not a service: the launcher runs it per task). `docker compose --profile build build agent`
+  agent:
+    build: ./images/agent
+    image: agentbox/agent:local
+    profiles: ["build"]

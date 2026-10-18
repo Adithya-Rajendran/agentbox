@@ -1,0 +1,285 @@
+"""agentbox MCP server: lets a frontier planner (Opus/Fable in Claude Code) hand well-specified coding
+tasks to LOCAL models (vLLM or Ollama) that run Claude Code in hardened, network-less containers.
+
+Runs unprivileged in its own container (streamable HTTP on 127.0.0.1, bearer-token protected). It never
+touches the Docker socket: containers are started by the separate launcher, which owns all hardening.
+
+Per delegate_task call:
+  1. trusted shadow git dir  <- fetch the repo's HEAD commit (the agent never sees this dir)
+  2. scratch clone (workspace) <- clone of the shadow; the agent gets full git inside it
+  3. per-task gateway socket  (model-pinned, token-metered Anthropic proxy) -> backend
+  4. launcher runs the agent: --network none, read-only rootfs, no caps, non-root, resource-capped
+  5. results are collected with the TRUSTED shadow git dir + a temporary index over the workspace
+     files - never by running git inside the agent-controlled .git (hooks/fsmonitor/config are
+     agent-writable there) - and fetched into the real repo as branch agent/<id>.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import secrets
+import shutil
+import time
+import uuid
+from pathlib import Path
+
+import uvicorn
+from mcp.server import MCPServer
+
+from .backends import Backends, LauncherClient, LauncherError
+from .common import EXCLUDES, LOG, REPOS_ROOT, SHADOWS, SOCKETS, WORKTREES, load_registry, under
+from .gateway import Gateway
+
+log = logging.getLogger("agentbox")
+MAX_DIFF_CHARS = 30_000
+SAFE_GIT = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "protocol.file.allow=always",
+            "-c", "user.name=local-agent", "-c", "user.email=agent@localhost"]
+
+REG = load_registry()
+LAUNCHER = LauncherClient()
+BACKENDS = Backends(REG, LAUNCHER)
+SEMAPHORES = {mid: asyncio.Semaphore(m.max_agents) for mid, m in REG.models.items()}
+ACTIVE: dict[str, dict] = {}
+
+WORKER_PREAMBLE = """You are an execution subagent. A senior engineer planned this task and will review your diff.
+Do exactly what the spec says, keep changes minimal and focused, run the relevant tests/commands to verify,
+and do not ask questions - make reasonable assumptions and state them. Do not commit; just leave the
+working tree changed. End with a short report: what you changed, how you verified it, anything unresolved.
+
+TASK SPEC:
+"""
+
+
+async def _run(*args: str, cwd: Path | None = None, env: dict | None = None) -> tuple[int, str, str]:
+    p = await asyncio.create_subprocess_exec(
+        *args, cwd=cwd, stdin=asyncio.subprocess.DEVNULL, env={**os.environ, **(env or {})},
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    out, err = await p.communicate()
+    return p.returncode, out.decode(errors="replace"), err.decode(errors="replace")
+
+
+async def _git(*args: str, **kw) -> str:
+    rc, out, err = await _run("git", *SAFE_GIT, *args, **kw)
+    if rc != 0:
+        raise RuntimeError(f"git {' '.join(args[:3])}: {err.strip()[:500]}")
+    return out
+
+
+server = MCPServer(
+    name="local-agents",
+    instructions=(
+        "delegate_task runs a coding task on a LOCAL open-weight model (vLLM or Ollama on the GB10) inside a "
+        "sandboxed container with no network, on an isolated clone (returned as branch agent/<id>). Use it for "
+        "well-specified execution work after you've planned. Give a precise, self-contained spec: files, "
+        "expected behaviour, how to verify. Review the returned diff, then merge the branch or re-delegate "
+        "with corrections. list_models shows the available models; tokens are free, wall-clock is the cost."
+    ),
+)
+
+
+@server.tool()
+async def list_models() -> dict:
+    """List the local models agents can use (backend, concurrency, description) and what is loaded now."""
+    try:
+        live = await BACKENDS.status()
+    except Exception as e:  # noqa: BLE001
+        live = {"error": str(e)}
+    return {
+        "default": REG.default_model,
+        "models": {mid: {"backend": m.backend, "max_concurrent_agents": m.max_agents,
+                         "description": m.description} for mid, m in REG.models.items()},
+        "live": live,
+        "active_tasks": {tid: {k: v for k, v in t.items() if k != "gateway"} for tid, t in ACTIVE.items()},
+    }
+
+
+@server.tool()
+async def delegate_task(
+    task: str,
+    repo_path: str,
+    model: str = REG.default_model,
+    max_turns: int = 60,
+    timeout_minutes: int = 30,
+    python_env: str | None = None,
+    use_executor_guide: bool = True,
+    preamble: bool = True,
+) -> dict:
+    """Run a well-specified coding task on a local model in a hardened, network-less container.
+
+    Args:
+        task: Self-contained spec: goal, files involved, constraints, and how to verify (test command).
+        repo_path: Absolute path to a git repo. Work happens on an isolated clone of its HEAD commit; the
+            result comes back as branch agent/<id>.
+        model: A model id from list_models (default: nemotron-3.5-bolt).
+        max_turns: Agent turn cap.
+        timeout_minutes: Wall-clock cap for the agent run (the model may first need several minutes to load).
+        python_env: Optional absolute path to a prebuilt venv (make_venv.sh), mounted read-only at /opt/venv.
+        use_executor_guide: Install the executor discipline guide as the agent's CLAUDE.md (default true).
+        preamble: Prepend the standard execution-subagent preamble to `task` (default true; benchmarks
+            that bring their own full prompt set false).
+
+    Returns: branch, status, the agent's final report, diff stat, diff (truncated), token usage, timings.
+    """
+    m = REG.models.get(model)
+    if not m:
+        return {"error": f"unknown model {model!r}; choose from {sorted(REG.models)}"}
+    repo = Path(repo_path).resolve()
+    if not under(repo, REPOS_ROOT):
+        return {"error": f"repo_path must be inside {REPOS_ROOT} (the only directory mounted into agentbox)"}
+    rc, top, _ = await _run("git", "-C", str(repo), "rev-parse", "--show-toplevel")
+    if rc != 0:
+        return {"error": f"{repo} is not a git repo"}
+    repo = Path(top.strip())
+    base = (await _git("-C", str(repo), "rev-parse", "HEAD")).strip()
+    tid = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
+    branch, wt, shadow = f"agent/{tid}", WORKTREES / tid, SHADOWS / f"{tid}.git"
+    notes: list[str] = []
+    note = lambda s: (notes.append(f"{time.strftime('%H:%M:%S')} {s}"), log.info("[%s] %s", tid, s))  # noqa: E731
+    ACTIVE[tid] = {"model": model, "repo": str(repo), "started": time.time(), "phase": "queued"}
+    gw = None
+    t_start = time.time()
+    try:
+        async with SEMAPHORES[model]:
+            ACTIVE[tid]["phase"] = "backend"
+            await BACKENDS.ensure(m, wait_s=3600, note=note)
+            t_ready = time.time()
+
+            ACTIVE[tid]["phase"] = "prepare"
+            WORKTREES.mkdir(parents=True, exist_ok=True)
+            SHADOWS.mkdir(parents=True, exist_ok=True)
+            await _git("init", "-q", "--bare", str(shadow))
+            await _git("--git-dir", str(shadow), "fetch", "-q", "--no-tags", str(repo), f"{base}:refs/heads/base")
+            await _git("clone", "-q", "--no-hardlinks", "-b", "base", str(shadow), str(wt))
+            await _git("-C", str(wt), "checkout", "-q", "-b", branch)
+            await _git("-C", str(wt), "config", "core.excludesFile", "/workspace/.git/agent-excludes")
+            await _git("-C", str(wt), "remote", "remove", "origin")
+            shutil.copyfile(EXCLUDES, wt / ".git/agent-excludes")
+
+            gw = Gateway(tid=tid, model=m)
+            await gw.start()
+            ACTIVE[tid].update(phase="running", gateway=gw)
+            env = {"ANTHROPIC_AUTH_TOKEN": gw.token, "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "32000"}
+            if not use_executor_guide:
+                env["AGENT_NO_GUIDE"] = "1"
+            cmd = ["claude", "-p", (WORKER_PREAMBLE if preamble else "") + task, "--output-format", "json",
+                   "--dangerously-skip-permissions", "--max-turns", str(max_turns)]
+            await LAUNCHER.call("POST", "/agents", {
+                "tid": tid, "model": model, "cmd": cmd, "env": env, "venv": python_env,
+                "timeout_s": timeout_minutes * 60})
+            res = await LAUNCHER.call("GET", f"/agents/{tid}", params={"wait": "1"})
+            t_done = time.time()
+    except (LauncherError, RuntimeError) as e:
+        if gw:
+            await gw.stop()
+            try:
+                await LAUNCHER.call("DELETE", f"/agents/{tid}")
+            except LauncherError:
+                pass
+        return {"error": str(e), "task_id": tid, "notes": notes}
+    finally:
+        ACTIVE.pop(tid, None)
+
+    await gw.stop()
+    try:
+        await LAUNCHER.call("DELETE", f"/agents/{tid}")
+    except LauncherError:
+        pass
+    timed_out = res.get("exit_code") in (137, 143) and (t_done - t_ready) >= timeout_minutes * 60 - 5
+    try:
+        out = json.loads(res.get("stdout") or "")
+    except json.JSONDecodeError:
+        out = {"subtype": "timeout" if timed_out else "harness_error",
+               "result": ((res.get("stdout") or "")[-2000:] + "\n" + (res.get("stderr") or "")[-2000:]).strip()}
+
+    # ---- collect with the trusted shadow git dir (never the agent's .git)
+    idx = SHADOWS / f"{tid}.index"
+    genv = {"GIT_DIR": str(shadow), "GIT_WORK_TREE": str(wt), "GIT_INDEX_FILE": str(idx)}
+    await _git("read-tree", base, env=genv)
+    await _git("-c", f"core.excludesFile={EXCLUDES}", "add", "-A", env=genv)
+    tree = (await _git("write-tree", env=genv)).strip()
+    commit = (await _git("commit-tree", tree, "-p", base, "-m", f"delegate_task {tid} ({model})",
+                         env=genv)).strip()
+    idx.unlink(missing_ok=True)
+    await _git("--git-dir", str(shadow), "update-ref", f"refs/heads/{branch}", commit)
+    await _git("-C", str(repo), "fetch", "-q", str(shadow), f"refs/heads/{branch}:refs/heads/{branch}")
+    stat = await _git("--git-dir", str(shadow), "diff", "--stat", base, commit)
+    diff = await _git("--git-dir", str(shadow), "diff", base, commit)
+
+    u = gw.usage.as_dict()
+    record = {
+        "task_id": tid, "ts": time.time(), "repo": str(repo), "branch": branch, "base": base, "model": model,
+        "backend": m.backend, "exit_code": res.get("exit_code"), "status": out.get("subtype"),
+        "is_error": out.get("is_error"), "num_turns": out.get("num_turns"),
+        "wait_s": round(t_ready - t_start, 1), "wall_s": round(t_done - t_ready, 1),
+        "input_tokens": u["input_tokens"], "output_tokens": u["output_tokens"], "requests": u["requests"],
+        "gateway_errors": u["errors"], "diff_lines": diff.count("\n"), "guide": use_executor_guide, "task": task,
+    }
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    with LOG.open("a") as f:
+        f.write(json.dumps(record) + "\n")
+    return {
+        "branch": branch, "status": out.get("subtype"), "exit_code": res.get("exit_code"),
+        "oom_killed": res.get("oom_killed"), "num_turns": out.get("num_turns"),
+        "wait_seconds": record["wait_s"], "wall_seconds": record["wall_s"], "usage": u,
+        "agent_report": str(out.get("result", ""))[-6000:],
+        "diff_stat": stat.strip(),
+        "diff": diff if len(diff) <= MAX_DIFF_CHARS else diff[:MAX_DIFF_CHARS] + "\n[...truncated]",
+        "notes": notes,
+        "merge_hint": f"git -C {repo} merge --no-ff {branch}   # then call cleanup_delegation",
+    }
+
+
+@server.tool()
+async def cleanup_delegation(repo_path: str, branch: str) -> dict:
+    """Delete a delegation's scratch clone, shadow git dir and `agent/<id>` branch (after merging or discarding)."""
+    tid = branch.removeprefix("agent/")
+    try:
+        await LAUNCHER.call("DELETE", f"/agents/{tid}")   # also hands the workspace back to agentbox's uid
+    except LauncherError:
+        pass
+    paths = [WORKTREES / tid, SHADOWS / f"{tid}.git"]
+    if not all(under(p.resolve(), root) for p, root in zip(paths, (WORKTREES, SHADOWS))):
+        return {"error": "bad branch name"}
+    for p in paths:
+        shutil.rmtree(p, ignore_errors=True)
+    repo = Path(repo_path).resolve()
+    if not under(repo, REPOS_ROOT):
+        return {"error": f"repo_path must be inside {REPOS_ROOT}"}
+    rc, _, e = await _run("git", "-C", str(repo), "branch", "-D", branch)
+    return {"scratch_removed": not paths[0].exists(), "branch_deleted": rc == 0, "errors": e.strip()}
+
+
+class BearerAuth:
+    """Tiny ASGI guard: every HTTP request must carry `Authorization: Bearer $AGENTBOX_MCP_TOKEN`."""
+
+    def __init__(self, app, token: str):
+        self.app, self.token = app, f"Bearer {token}".encode()
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            got = dict(scope["headers"]).get(b"authorization", b"")
+            if not secrets.compare_digest(got, self.token):
+                await send({"type": "http.response.start", "status": 401,
+                            "headers": [(b"content-type", b"text/plain")]})
+                await send({"type": "http.response.body", "body": b"unauthorized"})
+                return
+        await self.app(scope, receive, send)
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    token = os.environ.get("AGENTBOX_MCP_TOKEN")
+    if not token or len(token) < 24:
+        raise SystemExit("AGENTBOX_MCP_TOKEN (>= 24 chars) is required")
+    host = os.environ.get("AGENTBOX_HOST", "127.0.0.1")
+    port = int(os.environ.get("AGENTBOX_PORT", "8765"))
+    for d in (SOCKETS, SHADOWS, WORKTREES, LOG.parent):
+        d.mkdir(parents=True, exist_ok=True)
+    app = BearerAuth(server.streamable_http_app(host=host), token)
+    uvicorn.run(app, host=host, port=port, log_level="info", timeout_keep_alive=75)
+
+
+if __name__ == "__main__":
+    main()
