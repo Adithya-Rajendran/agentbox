@@ -7,6 +7,7 @@ only a short allowlist of environment variables is passed through. A compromised
 therefore start sandboxed agents and the configured model servers - nothing privileged.
 
   POST /agents          {tid, model, cmd[], env{}, venv?, timeout_s}  -> start a sandboxed agent
+  POST /checks          {tid, command, venv?, timeout_s}  -> run a command in the same sandbox, no gateway
   GET  /agents/{tid}    ?wait=1 -> {state, exit_code, stdout, stderr}  (wait blocks until exit)
   DELETE /agents/{tid}  kill + remove
   POST /backends/{model}/start      start this vLLM model (stops other vLLM models if idle; 409 if busy)
@@ -104,56 +105,44 @@ class Launcher:
         return {r["model"] for r in await self.running() if r["role"] == "agent" and r["state"] == "running"}
 
     # ---------------------------------------------------------------- agents
-    async def start_agent(self, req: web.Request) -> web.Response:
-        b = await req.json()
-        tid, model_id = str(b.get("tid", "")), str(b.get("model", ""))
+    def _workspace(self, tid: str) -> Path:
         if not TID_RE.match(tid):
             raise web.HTTPBadRequest(text="bad tid")
-        model = self.reg.models.get(model_id)
-        if not model:
-            raise web.HTTPBadRequest(text="unknown model")
-        cmd = b.get("cmd")
-        if not (isinstance(cmd, list) and cmd and cmd[0] == "claude" and all(isinstance(a, str) for a in cmd)):
-            raise web.HTTPBadRequest(text="cmd must be ['claude', ...]")
-        env = {k: str(v) for k, v in (b.get("env") or {}).items()}
-        if set(env) - ENV_ALLOW:
-            raise web.HTTPBadRequest(text=f"env not allowed: {sorted(set(env) - ENV_ALLOW)}")
-        timeout_s = min(int(b.get("timeout_s", 1800)), MAX_TIMEOUT_S)
-
         ws = (WORKTREES / tid).resolve()
-        sockdir = (SOCKETS / tid).resolve()
         if not (under(ws, WORKTREES) and ws.is_dir()):
             raise web.HTTPBadRequest(text="workspace missing")
-        if not (under(sockdir, SOCKETS) and (sockdir / "llm.sock").is_socket()):
-            raise web.HTTPBadRequest(text="gateway socket missing")
         st = ws.stat()
         if (st.st_uid, st.st_gid) != (OWNER_UID, OWNER_GID):
             raise web.HTTPBadRequest(text="workspace must be owned by the agentbox user")
-        binds = [f"{ws}:/workspace:rw", f"{sockdir}:/run/gw:rw"]
-        env_list = [f"{k}={v}" for k, v in env.items()]
-        if b.get("venv"):
-            venv = Path(b["venv"]).resolve()
-            if not (any(under(venv, r) for r in VENV_ROOTS) and (venv / "bin/python").exists()):
-                raise web.HTTPBadRequest(text=f"venv must be a built env under one of {VENV_ROOTS}")
-            binds.append(f"{venv}:/opt/venv:ro")
-            env_list += ["VIRTUAL_ENV=/opt/venv", "PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin"]
-        # The agent always asks for model.id; the gateway rewrites it to the backend's served name.
-        env_list += [f"ANTHROPIC_MODEL={model.id}", f"ANTHROPIC_DEFAULT_OPUS_MODEL={model.id}",
-                     f"ANTHROPIC_DEFAULT_SONNET_MODEL={model.id}", f"ANTHROPIC_DEFAULT_HAIKU_MODEL={model.id}",
-                     f"CLAUDE_CODE_SUBAGENT_MODEL={model.id}", "PYTHONDONTWRITEBYTECODE=1"]
+        return ws
+
+    @staticmethod
+    def _venv(b: dict) -> tuple[list[str], list[str]]:
+        if not b.get("venv"):
+            return [], []
+        venv = Path(b["venv"]).resolve()
+        if not (any(under(venv, r) for r in VENV_ROOTS) and (venv / "bin/python").exists()):
+            raise web.HTTPBadRequest(text=f"venv must be a built env under one of {VENV_ROOTS}")
+        return ([f"{venv}:/opt/venv:ro"],
+                ["VIRTUAL_ENV=/opt/venv", "PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin"])
+
+    async def _run_sandbox(self, tid: str, ws: Path, role: str, labels: dict, cmd: list[str],
+                           env_list: list[str], binds: list[str], timeout_s: int,
+                           entrypoint: list[str] | None = None) -> web.Response:
+        """Start one hardened sandbox container. Agents and checks share exactly this spec."""
         uid, gid = AGENT_UID, AGENT_GID
         name = AGENT_PREFIX + tid
         await self.chown_tree(ws, uid, gid)
         spec = {
             "Image": AGENT_IMAGE,
             "Cmd": cmd,
-            "Env": env_list,
+            "Env": env_list + ["PYTHONDONTWRITEBYTECODE=1"],
             "User": f"{uid}:{gid}",
             "WorkingDir": "/workspace",
             "NetworkDisabled": True,
-            "Labels": {LABEL: "agent", "agentbox.tid": tid, "agentbox.model": model.id},
+            "Labels": {LABEL: role, "agentbox.tid": tid, **labels},
             "HostConfig": {
-                "NetworkMode": "none",            # no interface but lo; the gateway socket is the only way out
+                "NetworkMode": "none",            # no interface but lo
                 "ReadonlyRootfs": True,
                 "CapDrop": ["ALL"],
                 "SecurityOpt": ["no-new-privileges:true"],
@@ -171,12 +160,54 @@ class Launcher:
                 **({"Runtime": AGENT_RUNTIME} if AGENT_RUNTIME else {}),
             },
         }
+        if entrypoint is not None:
+            spec["Entrypoint"] = entrypoint
         await self.docker.remove(name)
         await self.docker.req("POST", "/containers/create", spec, params={"name": name})
         await self.docker.req("POST", f"/containers/{name}/start")
         self.deadlines[tid] = asyncio.create_task(self._deadline(tid, timeout_s))
-        log.info("agent %s started model=%s ws=%s timeout=%ss", tid, model.id, ws, timeout_s)
+        log.info("%s %s started ws=%s timeout=%ss", role, tid, ws, timeout_s)
         return web.json_response({"name": name, "timeout_s": timeout_s})
+
+    async def start_agent(self, req: web.Request) -> web.Response:
+        b = await req.json()
+        tid, model_id = str(b.get("tid", "")), str(b.get("model", ""))
+        model = self.reg.models.get(model_id)
+        if not model:
+            raise web.HTTPBadRequest(text="unknown model")
+        cmd = b.get("cmd")
+        if not (isinstance(cmd, list) and cmd and cmd[0] == "claude" and all(isinstance(a, str) for a in cmd)):
+            raise web.HTTPBadRequest(text="cmd must be ['claude', ...]")
+        env = {k: str(v) for k, v in (b.get("env") or {}).items()}
+        if set(env) - ENV_ALLOW:
+            raise web.HTTPBadRequest(text=f"env not allowed: {sorted(set(env) - ENV_ALLOW)}")
+        timeout_s = min(int(b.get("timeout_s", 1800)), MAX_TIMEOUT_S)
+        ws = self._workspace(tid)
+        sockdir = (SOCKETS / tid).resolve()
+        if not (under(sockdir, SOCKETS) and (sockdir / "llm.sock").is_socket()):
+            raise web.HTTPBadRequest(text="gateway socket missing")
+        vbinds, venv_env = self._venv(b)
+        # The agent always asks for model.id; the gateway rewrites it to the backend's served name.
+        env_list = [f"{k}={v}" for k, v in env.items()] + venv_env + [
+            f"ANTHROPIC_MODEL={model.id}", f"ANTHROPIC_DEFAULT_OPUS_MODEL={model.id}",
+            f"ANTHROPIC_DEFAULT_SONNET_MODEL={model.id}", f"ANTHROPIC_DEFAULT_HAIKU_MODEL={model.id}",
+            f"CLAUDE_CODE_SUBAGENT_MODEL={model.id}"]
+        return await self._run_sandbox(tid, ws, "agent", {"agentbox.model": model.id}, cmd, env_list,
+                                       [f"{ws}:/workspace:rw", f"{sockdir}:/run/gw:rw", *vbinds], timeout_s)
+
+    async def start_check(self, req: web.Request) -> web.Response:
+        """Run a verification command (tests, linters) on a checked-out branch in the same sandbox as the
+        agents, but with no gateway socket at all: agent-written code never runs on the host."""
+        b = await req.json()
+        tid, command = str(b.get("tid", "")), b.get("command")
+        if not (isinstance(command, str) and 0 < len(command) <= 4000):
+            raise web.HTTPBadRequest(text="command must be a non-empty string (<= 4000 chars)")
+        timeout_s = min(int(b.get("timeout_s", 900)), 3600)
+        ws = self._workspace(tid)
+        vbinds, venv_env = self._venv(b)
+        return await self._run_sandbox(tid, ws, "check", {}, [command], venv_env,
+                                       [f"{ws}:/workspace:rw", *vbinds], timeout_s,
+                                       entrypoint=["bash", "-c"])
 
     async def _deadline(self, tid: str, timeout_s: int):
         await asyncio.sleep(timeout_s)
@@ -307,7 +338,8 @@ async def main():
     lz = Launcher()
     app = web.Application()
     app.add_routes([
-        web.post("/agents", lz.start_agent), web.get("/agents/{tid}", lz.get_agent),
+        web.post("/agents", lz.start_agent), web.post("/checks", lz.start_check),
+        web.get("/agents/{tid}", lz.get_agent),
         web.delete("/agents/{tid}", lz.delete_agent),
         web.post("/backends/vllm/stop", lz.stop_vllm), web.post("/backends/{model}/start", lz.start_backend),
         web.get("/status", lz.status),

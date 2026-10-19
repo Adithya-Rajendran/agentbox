@@ -9,7 +9,8 @@ Claude Code (Opus / Fable plans) ──MCP──▶ agentbox ──▶ agent con
                                                        no network · read-only · no caps · uid 64000
                                                                 │ one unix socket
                                                                 ▼
-                                                  vLLM (on demand) or Ollama on your GPU
+                                    vLLM / Ollama on your GPU   ·   llm-bridge ──▶ OpenAI / Anthropic / any
+                                                                    (keys live here)   OpenAI-compatible API
 ```
 
 - **One MCP tool, `delegate_task`.** Give it a spec and a repo path. A local model runs Claude Code
@@ -23,8 +24,16 @@ Claude Code (Opus / Fable plans) ──MCP──▶ agentbox ──▶ agent con
   Only a tiny launcher holds the Docker socket, and it builds every container spec itself.
 - **Safe result collection.** agentbox never runs git inside the agent's `.git` (which the agent controls,
   including hooks and `core.fsmonitor`). Results are committed through a trusted shadow git dir.
-- **vLLM and Ollama.** Ollama serves models on demand. vLLM models are started when first needed and are
-  never swapped out from under a running agent. Only one GPU family is resident at a time.
+- **vLLM, Ollama or OpenAI.** Ollama serves models on demand. vLLM models are started when first needed and
+  are never swapped out from under a running agent. Remote models go through **llm-bridge**, the only
+  container with provider keys:
+  - `backend: openai` covers the OpenAI API or any OpenAI-compatible server, with Messages ⇄ Chat
+    Completions translated, including streaming tool calls;
+  - `backend: anthropic` passes requests through to the Anthropic API.
+  
+  The agents stay network-less either way.
+- **Review without running agent code on your machine.** `run_checks` runs your tests on the returned
+  branch inside the same sandbox. Everything the agent sends back is labelled as untrusted data.
 - **A planner skill.** `skills/local-agent-delegation` teaches the planner to write specs that local models
   actually get right, and to review their work before merging.
 
@@ -41,7 +50,7 @@ Claude Code (Opus / Fable plans) ──MCP──▶ agentbox ──▶ agent con
 git clone https://github.com/Adithya-Rajendran/agentbox && cd agentbox
 scripts/setup.sh                       # writes .env (ids, paths, fresh MCP token) and config/models.yaml
 docker compose --profile build build   # agent image + agentbox image
-docker compose up -d                   # ollama, agentbox (MCP), agentbox-launcher
+docker compose up -d                   # ollama, agentbox (MCP), agentbox-launcher, llm-bridge
 scripts/smoke-test.sh                  # delegates a tiny bug fix, then checks the result and the sandbox
 ```
 
@@ -61,10 +70,11 @@ delegate_task, and review the branch it returns."*
 | Tool | What it does |
 |---|---|
 | `delegate_task(task, repo_path, model?, max_turns, timeout_minutes, python_env?, …)` | Runs the task in a sandbox. Returns the branch, status, report, diff, token usage and timings. |
+| `run_checks(repo_path, branch, command, python_env?)` | Runs a verification command on a branch inside the sandbox. Returns pass/fail plus the output tail. |
 | `list_models()` | Lists configured models, what's loaded now, and active tasks. |
 | `cleanup_delegation(repo_path, branch)` | Removes a task's scratch clone, shadow git dir and branch. |
 
-The same calls are available from the command line: `uv run --script cli.py models | delegate | cleanup`.
+The same calls are available from the command line: `uv run --script cli.py models | delegate | check | cleanup`.
 
 ## Documentation
 
@@ -83,3 +93,7 @@ agentbox is young and built for a single trusted workstation (everything binds t
 [security model](https://github.com/Adithya-Rajendran/agentbox/wiki/Security-Model) before running it
 anywhere else. The launcher holds the Docker socket, which is root-equivalent; it is small and does not
 parse model output, but it is the component to audit.
+
+## License
+
+[Apache License 2.0](LICENSE).

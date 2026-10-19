@@ -48,12 +48,20 @@ VLLM_PREFIX = "agentbox-vllm-"   # container name prefix for vLLM backends
 AGENT_PREFIX = "agentbox-agent-"
 
 
+# Remote/external endpoints, reached only through the llm-bridge container (which holds the provider keys
+# and is the only component that talks to them). No launcher, no GPU arbitration.
+EXTERNAL = ("openai", "anthropic")
+BRIDGE_URL = os.environ.get("AGENTBOX_BRIDGE_URL", "http://127.0.0.1:8790")
+BRIDGE_TOKEN = os.environ.get("AGENTBOX_BRIDGE_TOKEN", "")
+
+
 @dataclass
 class Model:
     id: str
-    backend: str                  # vllm | ollama
+    backend: str                  # vllm | ollama (local)  |  openai | anthropic (via llm-bridge)
     description: str = ""
     max_agents: int = 4
+    token_budget: int | None = None   # per-task input+output tokens (default: 20M local, 3M remote)
     # vllm
     port: int | None = None
     image: str | None = None
@@ -66,14 +74,42 @@ class Model:
     load_timeout_s: int = 1800
     # ollama
     ollama_model: str | None = None
+    # openai: the OpenAI API or any OpenAI-compatible /chat/completions server (translated by llm-bridge)
+    # anthropic: the Anthropic API or any /v1/messages endpoint (passed through by llm-bridge)
+    endpoint: str | None = None           # openai: base URL incl. /v1; anthropic: base URL without /v1
+    model_name: str | None = None         # model name sent upstream
+    api_key_env: str | None = None        # env var (in agentbox's environment) holding the key
+    max_output_tokens: int | None = None  # clamp max_tokens for servers with small output limits
+    token_param: str = "max_tokens"       # OpenAI's newer models want "max_completion_tokens"
+    drop_params: list[str] = field(default_factory=list)   # e.g. [temperature, top_p] for reasoning models
+    extra_body: dict = field(default_factory=dict)   # merged into every upstream request
+
+    @property
+    def external(self) -> bool:
+        return self.backend in EXTERNAL
 
     @property
     def served_name(self) -> str:
+        # external models are addressed by their agentbox id; llm-bridge maps that to model_name upstream
         return self.ollama_model if self.backend == "ollama" else self.id
 
     @property
     def base_url(self) -> str:
+        if self.external:
+            return BRIDGE_URL
         return OLLAMA_URL if self.backend == "ollama" else f"http://127.0.0.1:{self.port}"
+
+    @property
+    def budget(self) -> int:
+        return self.token_budget or (3_000_000 if self.external else 20_000_000)
+
+    @property
+    def upstream_url(self) -> str:
+        return (self.endpoint or "").rstrip("/")
+
+    @property
+    def api_key(self) -> str | None:
+        return os.environ.get(self.api_key_env) if self.api_key_env else None
 
 
 @dataclass
@@ -93,8 +129,10 @@ def load_registry(path: Path = MODELS_FILE) -> Registry:
         m = dict(m)
         if isinstance(m.get("args"), str):
             m["args"] = m["args"].split()
-        if m.get("backend") not in ("vllm", "ollama"):
-            raise ValueError(f"{mid}: backend must be vllm or ollama")
+        if m.get("backend") not in ("vllm", "ollama", *EXTERNAL):
+            raise ValueError(f"{mid}: backend must be vllm, ollama, openai or anthropic")
+        if m["backend"] in EXTERNAL and not (m.get("endpoint") and m.get("model_name")):
+            raise ValueError(f"{mid}: {m['backend']} models need endpoint and model_name")
         if m["backend"] == "vllm" and not (m.get("port") and m.get("image")):
             raise ValueError(f"{mid}: vllm models need port and image")
         if m["backend"] == "ollama" and not m.get("ollama_model"):

@@ -7,7 +7,7 @@ import time
 
 import aiohttp
 
-from .common import LAUNCHER_SOCK, OLLAMA_URL, Model, Registry
+from .common import BRIDGE_TOKEN, BRIDGE_URL, LAUNCHER_SOCK, OLLAMA_URL, Model, Registry
 
 log = logging.getLogger("agentbox.backends")
 
@@ -78,6 +78,9 @@ class Backends:
 
     async def ensure(self, m: Model, wait_s: float, note) -> None:
         """Block until `m` is servable. Waits (up to wait_s) while the other family has running agents."""
+        if m.external:   # OpenAI / OpenAI-compatible: nothing to start, just check it answers
+            await self._check_openai(m, note)
+            return
         deadline = time.time() + wait_s
         while True:
             try:
@@ -115,6 +118,19 @@ class Backends:
                 raise RuntimeError(f"vLLM {m.id} exited during load; see `journalctl -t agentbox-{m.id}`")
             await asyncio.sleep(10)
         raise RuntimeError(f"vLLM {m.id} not healthy after {time.time() - t0:.0f}s")
+
+    async def _check_openai(self, m: Model, note) -> None:
+        """Remote model: ask llm-bridge whether its key is configured and the upstream answers."""
+        try:
+            async with self.http.get(f"{BRIDGE_URL}/check/{m.id}", timeout=aiohttp.ClientTimeout(total=30),
+                                     headers={"authorization": f"Bearer {BRIDGE_TOKEN}"}) as r:
+                res = await r.json(content_type=None) if r.status == 200 else {"ok": False,
+                                                                               "error": f"bridge {r.status}"}
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            raise RuntimeError(f"llm-bridge unreachable at {BRIDGE_URL}: {e}") from e
+        if not res.get("ok"):
+            raise RuntimeError(f"{m.id}: {res.get('error')}")
+        note(f"{m.id}: {m.backend} upstream {m.upstream_url} reachable via llm-bridge")
 
     async def _ensure_ollama(self, m: Model, note) -> None:
         await self.launcher.call("POST", "/backends/vllm/stop")      # 409 while vLLM agents are running

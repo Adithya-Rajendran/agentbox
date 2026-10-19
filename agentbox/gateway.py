@@ -5,7 +5,10 @@ that agent only (agents cannot reach each other's sockets). It
   - accepts only POST /v1/messages and /v1/messages/count_tokens, with the task's one-time token;
   - pins the model: whatever the agent asks for, the request goes to this task's model;
   - answers count_tokens locally (Ollama lacks it; vLLM's is not needed for an estimate);
+  - sends remote models (openai / anthropic) to the llm-bridge container, never to the internet itself;
   - meters input/output tokens from the (streamed) responses and enforces a per-task token budget;
+  - strips server-side tools (web search/fetch, code execution), MCP servers and beta headers, so no
+    model API can reach the network on the agent's behalf;
   - never forwards the agent's credentials or arbitrary headers to the backend.
 """
 from __future__ import annotations
@@ -21,10 +24,13 @@ from pathlib import Path
 import aiohttp
 from aiohttp import web
 
-from .common import SOCKETS, Model
+from .common import BRIDGE_TOKEN, SOCKETS, Model
+from .openai_compat import sanitize_request
 
 log = logging.getLogger("agentbox.gateway")
-FORWARD_HEADERS = ("anthropic-version", "anthropic-beta")
+# anthropic-beta is deliberately NOT forwarded: betas enable server-side features (MCP connector, code
+# execution, web fetch) that would give the agent a way out.
+FORWARD_HEADERS = ("anthropic-version",)
 # Request fields some backends reject; dropped before forwarding (keyed by backend kind).
 STRIP_FIELDS = {"ollama": ("context_management", "container", "mcp_servers"),
                 "vllm": ("context_management", "container", "mcp_servers")}
@@ -107,10 +113,13 @@ class Gateway:
             # 403 is not retried by Claude Code, so the agent stops instead of hammering the budget.
             return _err(403, "permission_error", f"agentbox token budget ({self.token_budget}) exhausted")
 
+        sanitize_request(body)   # client-side tools only; no server-side tools, MCP servers or containers
         body["model"] = self.model.served_name
         for k in STRIP_FIELDS.get(self.model.backend, ()):
             body.pop(k, None)
         headers = {"content-type": "application/json", "x-api-key": "agentbox"}
+        if self.model.external:   # remote models go through llm-bridge, which holds the provider keys
+            headers = {"content-type": "application/json", "authorization": f"Bearer {BRIDGE_TOKEN}"}
         headers.update({h: req.headers[h] for h in FORWARD_HEADERS if h in req.headers})
         self.usage.requests += 1
         url = f"{self.model.base_url}/v1/messages"
@@ -131,13 +140,13 @@ class Gateway:
                 resp = web.StreamResponse(status=up.status, headers={"content-type": "text/event-stream",
                                                                      "cache-control": "no-cache"})
                 await resp.prepare(req)
-                buf = b""
+                buf, seen_in = b"", [0]
                 async for chunk in up.content.iter_any():
                     await resp.write(chunk)
                     buf += chunk
                     *lines, buf = buf.split(b"\n")
                     for line in lines:
-                        self._sse_line(line)
+                        self._sse_line(line, seen_in)
                 await resp.write_eof()
                 return resp
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
@@ -145,18 +154,27 @@ class Gateway:
             self.usage.last_error = f"{type(e).__name__}: {e}"
             return _err(529, "overloaded_error", f"backend unavailable: {e}")
 
-    def _sse_line(self, line: bytes) -> None:
+    def _sse_line(self, line: bytes, seen_in: list[int]) -> None:
         if not line.startswith(b"data:"):
             return
         try:
             ev = json.loads(line[5:])
         except ValueError:
             return
-        # input is reported once in message_start; message_delta carries the final cumulative output count.
+        # Input is normally reported in message_start; translated OpenAI streams only know it at the end, so
+        # message_delta may carry it too - count whatever exceeds what message_start already reported.
+        # message_delta carries the final cumulative output count.
         if ev.get("type") == "message_start":
-            self._add_input((ev.get("message") or {}).get("usage") or {})
+            u = (ev.get("message") or {}).get("usage") or {}
+            seen_in[0] = int(u.get("input_tokens") or 0) + int(u.get("cache_read_input_tokens") or 0)
+            self._add_input(u)
         elif ev.get("type") == "message_delta":
-            self._add_output(ev.get("usage") or {})
+            u = ev.get("usage") or {}
+            total_in = int(u.get("input_tokens") or 0) + int(u.get("cache_read_input_tokens") or 0)
+            if total_in > seen_in[0]:
+                self.usage.input_tokens += total_in - seen_in[0]
+                seen_in[0] = total_in
+            self._add_output(u)
 
     def _add_input(self, u: dict) -> None:
         self.usage.input_tokens += int(u.get("input_tokens") or 0) + int(u.get("cache_read_input_tokens") or 0)

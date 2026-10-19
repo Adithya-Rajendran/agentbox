@@ -4,6 +4,9 @@
 #   agentbox          MCP server (unprivileged, streamable HTTP + bearer token)  127.0.0.1:8765/mcp
 #   agentbox-launcher the ONLY container with the Docker socket; starts hardened agent containers
 #                     (--network none) and on-demand vLLM backends from config/models.yaml
+#   llm-bridge        the ONLY container with provider API keys (secrets.env); translates agents' Anthropic
+#                     Messages calls to the OpenAI API / OpenAI-compatible servers, or passes them through
+#                     to the Anthropic API                                         127.0.0.1:8790
 #
 # Host directories are mounted at the SAME path inside the containers, so a path means the same thing
 # to the MCP server, the launcher and the Docker daemon. Run scripts/setup.sh once (writes .env, creates dirs).
@@ -33,6 +36,8 @@ x-env: &agentbox-env
   AGENTBOX_LAUNCHER_SOCK: /run/agentbox/launcher.sock
   AGENTBOX_MODELS: /etc/agentbox-config/models.yaml
   AGENTBOX_EXCLUDES: /etc/agentbox-config/agent-gitignore
+  AGENTBOX_BRIDGE_URL: http://127.0.0.1:${AGENTBOX_BRIDGE_PORT:-8790}
+  AGENTBOX_BRIDGE_TOKEN: ${AGENTBOX_BRIDGE_TOKEN:?set AGENTBOX_BRIDGE_TOKEN (scripts/setup.sh)}
 
 services:
   ollama:
@@ -94,7 +99,24 @@ services:
       - ${AGENTBOX_DATA}:${AGENTBOX_DATA}
       - ${AGENTBOX_DATA}/run:/run/agentbox
       - ./config:/etc/agentbox-config:ro
-    depends_on: [agentbox-launcher, ollama]
+    depends_on: [agentbox-launcher, ollama, llm-bridge]
+
+  llm-bridge:
+    <<: *hardened
+    image: agentbox/server:local
+    container_name: llm-bridge
+    command: ["agentbox.bridge"]
+    network_mode: host                   # egress to remote APIs + local OpenAI-compatible servers; binds 127.0.0.1
+    pids_limit: 128
+    mem_limit: 512m
+    env_file: [secrets.env]              # provider keys live ONLY here (not in .env, not in agentbox)
+    environment:
+      AGENTBOX_BRIDGE_TOKEN: ${AGENTBOX_BRIDGE_TOKEN}
+      AGENTBOX_BRIDGE_HOST: 127.0.0.1
+      AGENTBOX_BRIDGE_PORT: ${AGENTBOX_BRIDGE_PORT:-8790}
+      AGENTBOX_MODELS: /etc/agentbox-config/models.yaml
+    volumes:
+      - ./config:/etc/agentbox-config:ro
 
   # Agent image (not a service: the launcher runs it per task). `docker compose --profile build build agent`
   agent:

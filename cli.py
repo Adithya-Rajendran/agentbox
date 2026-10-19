@@ -7,6 +7,7 @@
   uv run --script cli.py models
   uv run --script cli.py delegate --repo /path/to/repo --task-file spec.md \
       [--model nemotron-3.5-bolt] [--venv PATH] [--no-guide] [--timeout-min 30] [--max-turns 60]
+  uv run --script cli.py check --repo /path/to/repo --branch agent/<id> --command "python -m pytest -q" [--venv PATH]
   uv run --script cli.py cleanup --repo /path/to/repo --branch agent/<id>
 
 Token: $AGENTBOX_MCP_TOKEN, else read from .env next to this file.
@@ -63,12 +64,24 @@ def main() -> None:
     d.add_argument("--timeout-min", type=int, default=30)
     d.add_argument("--max-turns", type=int, default=60)
     d.add_argument("--raw", action="store_true", help="send the task text verbatim (no subagent preamble)")
+    k = sub.add_parser("check", help="run a command on a branch inside the sandbox (run_checks)")
+    k.add_argument("--repo", required=True)
+    k.add_argument("--branch", required=True)
+    k.add_argument("--command", required=True)
+    k.add_argument("--venv")
+    k.add_argument("--timeout-min", type=int, default=15)
     c = sub.add_parser("cleanup")
     c.add_argument("--repo", required=True)
     c.add_argument("--branch", required=True)
     a = ap.parse_args()
     if a.cmd == "models":
         out = asyncio.run(call("list_models", {}, 60))
+    elif a.cmd == "check":
+        args = {"repo_path": str(Path(a.repo).resolve()), "branch": a.branch, "command": a.command,
+                "timeout_minutes": a.timeout_min}
+        if a.venv:
+            args["python_env"] = str(Path(a.venv).resolve())
+        out = asyncio.run(call("run_checks", args, (a.timeout_min + 5) * 60))
     elif a.cmd == "cleanup":
         out = asyncio.run(call("cleanup_delegation", {"repo_path": a.repo, "branch": a.branch}, 60))
     else:
