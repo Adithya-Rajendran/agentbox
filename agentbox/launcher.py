@@ -8,6 +8,10 @@ therefore start sandboxed agents and the configured model servers - nothing priv
 
   POST /agents          {tid, model, cmd[], env{}, venv?, timeout_s}  -> start a sandboxed agent
   POST /checks          {tid, command, venv?, timeout_s}  -> run a command in the same sandbox, no gateway
+  POST /repo/snapshot   {tid, path, ref?}   -> copy one commit of the planner's repo into the shadow git dir
+  POST /repo/deliver    {tid, path, branch} -> fetch agent/<id> from the shadow into the planner's repo
+  POST /repo/delete-branch {path, branch}   -> delete an agent/<id> branch
+  (repo operations run in short-lived git-helper containers that mount only that one repo)
   GET  /agents/{tid}    ?wait=1 -> {state, exit_code, stdout, stderr}  (wait blocks until exit)
   DELETE /agents/{tid}  kill + remove
   POST /backends/{model}/start      start this vLLM model (stops other vLLM models if idle; 409 if busy)
@@ -27,8 +31,47 @@ from pathlib import Path
 import aiohttp
 from aiohttp import web
 
-from .common import (AGENT_GID, AGENT_IMAGE, AGENT_PREFIX, AGENT_UID, LABEL, LAUNCHER_SOCK, OWNER_GID,
-                     OWNER_UID, SOCKETS, TID_RE, VENV_ROOTS, VLLM_PREFIX, WORKTREES, load_registry, under)
+import re
+import stat as statmod
+import uuid
+
+from .common import (AGENT_GID, AGENT_IMAGE, AGENT_PREFIX, AGENT_UID, DATA, LABEL, LAUNCHER_SOCK, OWNER_GID,
+                     OWNER_UID, REPOS_ROOT, SHADOWS, SOCKETS, TID_RE, VENV_ROOTS, VLLM_PREFIX, WORKTREES,
+                     host_path_ok, load_registry, under)
+
+AGENT_BRANCH_RE = re.compile(r"^agent/[0-9a-z][0-9a-z-]{0,63}$")
+WORKTREE_GITDIR_RE = re.compile(r"^(/.+/\.git)/worktrees/[^/]+$")
+
+# Git-helper scripts (run with sh -ec in a short-lived container as the agentbox uid, network none).
+# /src or /dst is the ONE repo mounted for this request; /shadow is agentbox's trusted bare repo.
+PROBE = """
+o=$(stat -c %u /src); [ "$o" = "$(id -u)" ] || { echo "not owned by the agentbox user (owner uid $o)" >&2; exit 3; }
+if [ -d /src/.git ]; then echo repo
+elif [ -f /src/.git ]; then sed -n 's/^gitdir: //p' /src/.git | head -1
+else echo none; fi
+"""
+SNAPSHOT = """
+cd /src
+git rev-parse --git-dir >/dev/null
+sha=$(git rev-parse --verify --quiet "$1^{commit}") || { echo "not a commit in this repo: $1" >&2; exit 5; }
+git init -q --bare /shadow
+git --git-dir=/shadow fetch -q --no-tags /src "$sha:refs/heads/base"
+echo "$sha"
+"""
+DELIVER = """
+cd /dst
+o=$(stat -c %u /dst); [ "$o" = "$(id -u)" ] || { echo "repo not owned by the agentbox user" >&2; exit 3; }
+git fetch -q --no-tags /shadow "refs/heads/$1:refs/heads/$1"
+"""
+DELETE_BRANCH = """
+cd /dst
+o=$(stat -c %u /dst); [ "$o" = "$(id -u)" ] || { echo "repo not owned by the agentbox user" >&2; exit 3; }
+git branch -D "$1"
+"""
+VENV_CHECK = """
+o=$(stat -c %u /v); [ "$o" = "$(id -u)" ] || { echo "venv not owned by the agentbox user" >&2; exit 3; }
+[ -x /v/bin/python ] || { echo "not a venv (no bin/python)" >&2; exit 4; }
+"""
 
 log = logging.getLogger("agentbox.launcher")
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
@@ -106,24 +149,40 @@ class Launcher:
         return {r["model"] for r in await self.running() if r["role"] == "agent" and r["state"] == "running"}
 
     # ---------------------------------------------------------------- agents
+    @staticmethod
+    def _real_dir(p: Path) -> os.stat_result:
+        """lstat every component from DATA down: a symlink anywhere (e.g. worktrees -> /) is refused, so the
+        path the Docker daemon mounts on the host is the directory checked here."""
+        rel = p.relative_to(DATA)
+        cur = DATA
+        for part in (None, *rel.parts):
+            cur = cur if part is None else cur / part
+            st = os.lstat(cur)
+            if statmod.S_ISLNK(st.st_mode) or not statmod.S_ISDIR(st.st_mode):
+                raise web.HTTPBadRequest(text=f"refusing non-directory or symlink: {cur}")
+        return st
+
     def _workspace(self, tid: str) -> Path:
         if not TID_RE.match(tid):
             raise web.HTTPBadRequest(text="bad tid")
-        ws = (WORKTREES / tid).resolve()
-        if not (under(ws, WORKTREES) and ws.is_dir()):
-            raise web.HTTPBadRequest(text="workspace missing")
-        st = ws.stat()
+        ws = WORKTREES / tid
+        try:
+            st = self._real_dir(ws)
+        except FileNotFoundError:
+            raise web.HTTPBadRequest(text="workspace missing") from None
         if (st.st_uid, st.st_gid) != (OWNER_UID, OWNER_GID):
             raise web.HTTPBadRequest(text="workspace must be owned by the agentbox user")
         return ws
 
-    @staticmethod
-    def _venv(b: dict) -> tuple[list[str], list[str]]:
+    async def _venv(self, b: dict) -> tuple[list[str], list[str]]:
         if not b.get("venv"):
             return [], []
-        venv = Path(b["venv"]).resolve()
-        if not (any(under(venv, r) for r in VENV_ROOTS) and (venv / "bin/python").exists()):
-            raise web.HTTPBadRequest(text=f"venv must be a built env under one of {VENV_ROOTS}")
+        venv = str(b["venv"])
+        if not host_path_ok(venv, VENV_ROOTS):
+            raise web.HTTPBadRequest(text=f"venv must be a normalized absolute path under one of {VENV_ROOTS}")
+        code, _, err = await self._helper(VENV_CHECK, [], [(venv, "/v", True)])
+        if code != 0:
+            raise web.HTTPBadRequest(text=f"venv {venv}: {err.strip()[-300:]}")
         return ([f"{venv}:/opt/venv:ro"],
                 ["VIRTUAL_ENV=/opt/venv", "PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin"])
 
@@ -185,10 +244,15 @@ class Launcher:
             raise web.HTTPBadRequest(text=f"env not allowed: {sorted(set(env) - ENV_ALLOW)}")
         timeout_s = min(int(b.get("timeout_s", 1800)), MAX_TIMEOUT_S)
         ws = self._workspace(tid)
-        sockdir = (SOCKETS / tid).resolve()
-        if not (under(sockdir, SOCKETS) and (sockdir / "llm.sock").is_socket()):
+        sockdir = SOCKETS / tid
+        try:
+            self._real_dir(sockdir)
+            sock_ok = statmod.S_ISSOCK(os.lstat(sockdir / "llm.sock").st_mode)
+        except FileNotFoundError:
+            sock_ok = False
+        if not sock_ok:
             raise web.HTTPBadRequest(text="gateway socket missing")
-        vbinds, venv_env = self._venv(b)
+        vbinds, venv_env = await self._venv(b)
         # The agent always asks for model.id; the gateway rewrites it to the backend's served name.
         env_list = [f"{k}={v}" for k, v in env.items()] + venv_env + [
             f"ANTHROPIC_MODEL={model.id}", f"ANTHROPIC_DEFAULT_OPUS_MODEL={model.id}",
@@ -206,7 +270,7 @@ class Launcher:
             raise web.HTTPBadRequest(text="command must be a non-empty string (<= 4000 chars)")
         timeout_s = min(int(b.get("timeout_s", 900)), 3600)
         ws = self._workspace(tid)
-        vbinds, venv_env = self._venv(b)
+        vbinds, venv_env = await self._venv(b)
         return await self._run_sandbox(tid, ws, "check", {}, [command], venv_env,
                                        [f"{ws}:/workspace:rw", *vbinds], timeout_s,
                                        entrypoint=["bash", "-c"])
@@ -241,34 +305,151 @@ class Launcher:
         await self.docker.remove(AGENT_PREFIX + tid)
         if t := self.deadlines.pop(tid, None):
             t.cancel()
-        ws = (WORKTREES / tid).resolve()
-        if under(ws, WORKTREES) and ws.is_dir() and ws.stat().st_uid != OWNER_UID:
+        ws = WORKTREES / tid
+        try:
+            st = self._real_dir(ws)
+        except (FileNotFoundError, web.HTTPBadRequest):
+            st = None
+        if st is not None and st.st_uid != OWNER_UID:
             await self.chown_tree(ws, OWNER_UID, OWNER_GID)
         return web.json_response({"removed": tid})
 
     async def chown_tree(self, ws: Path, uid: int, gid: int) -> None:
-        """Hand a workspace to another uid with a throwaway fixed-spec container (the launcher itself has
-        no capabilities). Only the one workspace is mounted, so symlinks inside it cannot reach the host;
-        `chown -R -h` changes links themselves and never follows them."""
-        name = f"agentbox-chown-{ws.name}"
+        """Hand a workspace to another uid with a throwaway fixed-spec root container (the launcher itself has
+        no capabilities). It first checks that the mounted directory is the exact inode validated here (so a
+        path swapped after the check is refused), then `chown -R -h` (never follows symlinks) and gives the
+        new owner read/write on everything (an agent leaving mode-000 files must not break collection)."""
+        st = self._real_dir(ws)
+        expect = f"{st.st_dev}:{st.st_ino}"
+        name = f"agentbox-chown-{ws.name}-{uuid.uuid4().hex[:6]}"
+        script = ('[ "$(stat -c %d:%i /w)" = "$1" ] || { echo "workspace changed under us" >&2; exit 9; }; '
+                  'chown -R -h "$2" /w && chmod -R u+rwX /w')
         spec = {
-            "Image": AGENT_IMAGE, "Entrypoint": ["chown"], "Cmd": ["-R", "-h", f"{uid}:{gid}", "/w"],
-            "User": "0:0", "NetworkDisabled": True, "Labels": {LABEL: "chown"},
+            "Image": AGENT_IMAGE, "Entrypoint": ["sh", "-ec", script, "chown"], "Cmd": [expect, f"{uid}:{gid}"],
+            "User": "0:0", "Labels": {LABEL: "chown"},
             "HostConfig": {"NetworkMode": "none", "ReadonlyRootfs": True, "CapDrop": ["ALL"],
                            "CapAdd": ["CHOWN", "DAC_OVERRIDE", "FOWNER"],
                            "SecurityOpt": ["no-new-privileges:true"], "PidsLimit": 16,
-                           # Always runc: this fixed command executes no untrusted code (chown -h never
-                           # follows links), and gVisor's own threads would not fit its tiny pids limit.
+                           # runc: this fixed command executes no untrusted code (chown -h never follows
+                           # links), and gVisor's own threads would not fit its tiny pids limit.
+                           "Runtime": "runc",
                            "Binds": [f"{ws}:/w:rw"]},
         }
+        code, _, err = await self._run_fixed(name, spec, timeout_s=600)
+        if code != 0:
+            raise web.HTTPInternalServerError(text=f"chown {ws} -> {uid}:{gid} failed: {err[-300:]}")
+
+    async def _run_fixed(self, name: str, spec: dict, timeout_s: int) -> tuple[int, str, str]:
+        """Create, run, wait for and remove a short-lived container; returns (exit code, stdout, stderr)."""
+        spec.setdefault("HostConfig", {}).setdefault("LogConfig", {"Type": "json-file",
+                                                                    "Config": {"max-size": "2m"}})
         await self.docker.remove(name)
         await self.docker.req("POST", "/containers/create", spec, params={"name": name})
-        await self.docker.req("POST", f"/containers/{name}/start")
-        res = await self.docker.req("POST", f"/containers/{name}/wait", ok=(200,))
-        _, err = await self.docker.logs(name)
-        await self.docker.remove(name)
-        if res.get("StatusCode") != 0:
-            raise web.HTTPInternalServerError(text=f"chown {ws} -> {uid}:{gid} failed: {err[-300:]}")
+        try:
+            await self.docker.req("POST", f"/containers/{name}/start")
+            try:
+                res = await asyncio.wait_for(
+                    self.docker.req("POST", f"/containers/{name}/wait", ok=(200,)), timeout_s)
+            except asyncio.TimeoutError:
+                await self.docker.req("POST", f"/containers/{name}/kill", ok=(204, 404, 409))
+                return 124, "", f"timed out after {timeout_s}s"
+            out, err = await self.docker.logs(name)
+            return res.get("StatusCode", 1), out, err
+        finally:
+            await self.docker.remove(name)
+
+    async def _helper(self, script: str, args: list[str], mounts: list[tuple[str, str, bool]],
+                      timeout_s: int = 300) -> tuple[int, str, str]:
+        """Run a fixed git/stat script in a short-lived container as the agentbox user: no network, no
+        capabilities, read-only root. `mounts` = [(host path, container path, read_only)] - exactly what this
+        one operation needs. Mounts (not Binds) so a missing host path is an error, never created as root."""
+        spec = {
+            "Image": AGENT_IMAGE, "Entrypoint": ["sh", "-ec", script, "helper"], "Cmd": args,
+            "User": f"{OWNER_UID}:{OWNER_GID}", "WorkingDir": "/",
+            "Env": ["HOME=/tmp", "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0"],
+            "Labels": {LABEL: "git"},
+            "HostConfig": {"NetworkMode": "none", "ReadonlyRootfs": True, "CapDrop": ["ALL"],
+                           "SecurityOpt": ["no-new-privileges:true"], "PidsLimit": 64,
+                           "Memory": 1 << 30, "Tmpfs": {"/tmp": "rw,nosuid,nodev,size=64m"},
+                           "Runtime": "runc",
+                           "Mounts": [{"Type": "bind", "Source": src, "Target": dst, "ReadOnly": ro,
+                                       "BindOptions": {"Propagation": "rprivate"}} for src, dst, ro in mounts]},
+        }
+        try:
+            return await self._run_fixed(f"agentbox-git-{uuid.uuid4().hex[:10]}", spec, timeout_s)
+        except web.HTTPBadGateway as e:   # e.g. "bind source path does not exist"
+            return 2, "", e.text
+
+    # ---------------------------------------------------------------- repos (per request, one repo at a time)
+    async def _repo_mounts(self, path: str, target: str, rw: bool) -> tuple[str, list[tuple[str, str, bool]]]:
+        """Find the repo for `path` (the planner's current folder, or any folder inside the repo) and return
+        (repo root, mounts) with the root at `target`. Walks up at most to the allowlist root. Linked worktrees
+        (.git is a file "gitdir: <main>/.git/worktrees/<name>") also get their common .git dir, mounted at its
+        own host path so the absolute link still resolves."""
+        if not host_path_ok(path, [REPOS_ROOT]):
+            raise web.HTTPBadRequest(text=f"repo_path must be a normalized absolute path inside {REPOS_ROOT}")
+        cur = path
+        while host_path_ok(cur, [REPOS_ROOT]):
+            code, out, err = await self._helper(PROBE, [], [(cur, "/src", True)], timeout_s=60)
+            if code != 0:
+                if "does not exist" in err or "invalid mount config" in err:
+                    raise web.HTTPBadRequest(text=f"{cur}: folder does not exist")
+                raise web.HTTPBadRequest(text=f"{cur}: {err.strip()[-300:] or 'not accessible'}")
+            kind = out.strip()
+            if kind == "repo":
+                return cur, [(cur, target, not rw)]
+            if kind != "none":
+                m = WORKTREE_GITDIR_RE.match(kind)
+                if not (m and host_path_ok(m.group(1), [REPOS_ROOT])):
+                    raise web.HTTPBadRequest(text=f"{cur}: unsupported .git link {kind!r}")
+                return cur, [(cur, target, not rw), (m.group(1), m.group(1), not rw)]
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
+        raise web.HTTPBadRequest(text=f"{path} is not inside a git repository under {REPOS_ROOT}")
+
+    def _shadow(self, tid: str) -> Path:
+        if not TID_RE.match(tid):
+            raise web.HTTPBadRequest(text="bad tid")
+        sh = SHADOWS / f"{tid}.git"
+        self._real_dir(sh)
+        return sh
+
+    async def repo_snapshot(self, req: web.Request) -> web.Response:
+        """Fetch one commit (default HEAD) of the planner's repo into agentbox's shadow git dir."""
+        b = await req.json()
+        ref = str(b.get("ref") or "HEAD")
+        if ref.startswith("-") or len(ref) > 200 or any(ord(c) < 32 for c in ref):
+            raise web.HTTPBadRequest(text="bad ref")
+        shadow = self._shadow(str(b.get("tid", "")))
+        top, mounts = await self._repo_mounts(str(b.get("path", "")), "/src", rw=False)
+        code, out, err = await self._helper(SNAPSHOT, [ref], mounts + [(str(shadow), "/shadow", False)])
+        if code != 0:
+            raise web.HTTPBadRequest(text=f"snapshot failed: {err.strip()[-400:]}")
+        return web.json_response({"repo": top, "sha": out.strip().splitlines()[-1]})
+
+    async def repo_deliver(self, req: web.Request) -> web.Response:
+        """Fetch branch agent/<id> from the shadow into the planner's repo (the only write to it)."""
+        b = await req.json()
+        branch = str(b.get("branch", ""))
+        if not AGENT_BRANCH_RE.match(branch):
+            raise web.HTTPBadRequest(text="branch must be agent/<id>")
+        shadow = self._shadow(str(b.get("tid", "")))
+        top, mounts = await self._repo_mounts(str(b.get("path", "")), "/dst", rw=True)
+        code, _, err = await self._helper(DELIVER, [branch], mounts + [(str(shadow), "/shadow", True)])
+        if code != 0:
+            raise web.HTTPBadRequest(text=f"deliver failed: {err.strip()[-400:]}")
+        return web.json_response({"repo": top, "branch": branch})
+
+    async def repo_delete_branch(self, req: web.Request) -> web.Response:
+        b = await req.json()
+        branch = str(b.get("branch", ""))
+        if not AGENT_BRANCH_RE.match(branch):
+            raise web.HTTPBadRequest(text="only agent/<id> branches can be deleted")
+        top, mounts = await self._repo_mounts(str(b.get("path", "")), "/dst", rw=True)
+        code, _, err = await self._helper(DELETE_BRANCH, [branch], mounts)
+        return web.json_response({"repo": top, "deleted": code == 0, "error": err.strip()[-300:]})
 
     # ---------------------------------------------------------------- backends
     def _vllm_name(self, model_id: str) -> str:
@@ -361,6 +542,8 @@ async def main():
     app = web.Application()
     app.add_routes([
         web.post("/agents", lz.start_agent), web.post("/checks", lz.start_check),
+        web.post("/repo/snapshot", lz.repo_snapshot), web.post("/repo/deliver", lz.repo_deliver),
+        web.post("/repo/delete-branch", lz.repo_delete_branch),
         web.get("/agents/{tid}", lz.get_agent),
         web.delete("/agents/{tid}", lz.delete_agent),
         web.post("/backends/vllm/stop", lz.stop_vllm), web.post("/backends/{model}/start", lz.start_backend),

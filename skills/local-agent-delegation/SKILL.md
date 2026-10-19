@@ -30,11 +30,10 @@ judgment, or needs the network.
 
 Call `list_models` to see what is configured, what is loaded right now, and what is running.
 
-- `nemotron-3.5-bolt` (vLLM, default): best local quality; serves up to 8 agents at once.
-- `ornith-1.5-35b` (vLLM): lower quality, many concurrent sequences — for fanning out many small,
-  well-specified tasks.
-- `nemotron-3.5-lightning` (Ollama): agent-tuned 30B-A3B; no multi-minute vLLM load, handy for quick
-  one-off tasks when no vLLM model is resident.
+Leave `model` out to use the configured default. Otherwise pick from `list_models` by its description:
+the strongest model for tricky work, a many-sequence model for fanning out small tasks, a smaller or
+already-loaded model for quick one-offs. Remote models (`remote: true`) cost money and send code to the
+provider — use them only when the user has set them up for that.
 - Only one GPU family is resident at a time, and one vLLM model at a time. Switching reloads (vLLM: ~5–7
   min) and waits for agents on the other model to finish, so batch tasks per model instead of alternating.
   The result's `wait_seconds` shows time spent queued or loading.
@@ -74,15 +73,18 @@ The container has no network, so the executor can only run tests if you hand it 
 Build one on the host and pass it as `python_env`:
 
 ```bash
-.claude/skills/local-agent-delegation/scripts/make_venv.sh <repo_path>   # prints the venv path
+<this skill's directory>/scripts/make_venv.sh <repo_path>   # prints the venv path (e.g. ~/.claude/skills/local-agent-delegation/...)
 ```
 
 ```
-delegate_task(task=<spec>, repo_path=<abs path to git repo>, model="nemotron-3.5-bolt",
+delegate_task(task=<spec>, repo_path=<your current working directory>,
               max_turns=60, timeout_minutes=30, python_env=<path printed above>)
 ```
 
-- The agent works on a **clone of HEAD** — commit (or stash) anything it needs to see first.
+- **`repo_path` is your current folder** (absolute path; any folder inside the repo works). Only that one
+  repo is touched, briefly: its HEAD is copied in and the result branch is written back.
+- The agent works on a **clone of HEAD** — commit anything it needs to see first (stashed or uncommitted
+  changes are invisible to it).
 - Raise `timeout_minutes` for genuinely large tasks, or better, split them. `status: timeout` means the agent
   was killed mid-work; the diff may still be useful.
 

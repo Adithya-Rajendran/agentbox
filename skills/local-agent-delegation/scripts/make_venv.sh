@@ -12,7 +12,7 @@ set -euo pipefail
 REPO="$(realpath "${1:?usage: make_venv.sh <repo_path> [extra packages...]}")"; shift || true
 EXTRA="$*"
 NAME="$(basename "$REPO")-$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo nogit)"
-VENV="${LOCAL_AGENT_VENVS:-$HOME/.cache/local-agent-venvs}/$NAME"
+VENV="${AGENTBOX_VENVS:-${LOCAL_AGENT_VENVS:-$HOME/.cache/local-agent-venvs}}/$NAME"   # must match agentbox's AGENTBOX_VENVS
 mkdir -p "$VENV"
 uid=$(stat -c %u "$REPO"); gid=$(stat -c %g "$REPO")
 docker run --rm --user "$uid:$gid" --cap-drop ALL --security-opt no-new-privileges:true \

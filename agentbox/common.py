@@ -26,9 +26,10 @@ WORKTREES = DATA / "worktrees"      # scratch clones the agents work in; the lau
 SOCKETS = DATA / "sockets"          # SOCKETS/<tid>/llm.sock, bind-mounted into that agent at /run/gw
 SHADOWS = DATA / "git"              # trusted per-task git dirs the agent never sees
 LOG = DATA / "logs" / "delegations.jsonl"
-# Repos the MCP server may delegate on (mounted read-write into it, read-only into the launcher).
-REPOS_ROOT = env_path("AGENTBOX_REPOS_ROOT", "/srv/repos")
-# Prebuilt Python envs may live here or anywhere under REPOS_ROOT; mounted read-only into agents.
+# Allowlist for repo paths the planner may pass (e.g. its current folder). NOTHING is mounted from here:
+# each request mounts only the one repo, briefly, into a short-lived git-helper container.
+REPOS_ROOT = env_path("AGENTBOX_REPOS_ROOT", "/home")
+# Prebuilt Python envs may live under these roots (also allowlists; verified per request by a helper).
 VENV_ROOTS = [p for p in (env_path("AGENTBOX_VENVS", "/var/lib/agentbox-venvs"), REPOS_ROOT)]
 LAUNCHER_SOCK = env_path("AGENTBOX_LAUNCHER_SOCK", "/run/agentbox/launcher.sock")
 MODELS_FILE = env_path("AGENTBOX_MODELS", "/etc/agentbox-config/models.yaml")
@@ -142,6 +143,17 @@ def load_registry(path: Path = MODELS_FILE) -> Registry:
     p = raw.get("paths") or {}
     return Registry(models, raw.get("default_model") or next(iter(models)),
                     p.get("models_dir", ""), p.get("vllm_cache", ""))
+
+
+def host_path_ok(p: str, roots: list[Path]) -> bool:
+    """A host path string we may hand to Docker: absolute, already normalized (no '..', '//', trailing '/'),
+    no control characters, and inside one of `roots`. Symlinks are NOT resolved here (that would be the
+    caller's view, not the host's); the git helper verifies ownership of whatever Docker actually mounts."""
+    if not p or len(p) > 4096 or not p.startswith("/") or os.path.normpath(p) != p:
+        return False
+    if any(ord(c) < 32 for c in p) or ":" in p or "," in p:      # ':' / ',' would confuse bind syntax
+        return False
+    return any(p == str(r) or p.startswith(str(r).rstrip("/") + "/") for r in roots)
 
 
 def under(child: Path, root: Path) -> bool:

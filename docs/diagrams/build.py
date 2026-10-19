@@ -111,8 +111,8 @@ def architecture():
     s = Scene()
     s.text("agentbox: components", 640, 24, size=28)
     planner = s.box(20, 300, 200, 100, "Claude Code\n(planner: Opus / Fable)", F_YELLOW, AMBER, size=17)
-    repos = s.box(20, 560, 200, 80, "your repos", F_TEAL, TEAL)
-    s.zone(270, 70, 1010, 690, "host  (everything binds to 127.0.0.1)", Z_BLUE, BLUE)
+    repos = s.box(20, 560, 200, 80, "your repo\n(current folder)", F_TEAL, TEAL, size=17)
+    s.zone(270, 70, 1010, 700, "host  (everything binds to 127.0.0.1)", Z_BLUE, BLUE)
     ab = s.box(330, 260, 290, 150, "agentbox\nMCP server · per-task gateways\nshadow-git result collection\nunprivileged", F_PURPLE, PURPLE)
     la = s.box(330, 560, 290, 110, "agentbox-launcher\nonly holder of docker.sock\nnetwork: none", F_ORANGE, AMBER)
     s.zone(700, 470, 330, 270, "sandboxes (one per task)", Z_RED, RED, size=16)
@@ -123,8 +123,10 @@ def architecture():
     br = s.box(1000, 230, 250, 110, "llm-bridge\nonly holder of API keys\ntranslate / pass-through", F_BLUE, BLUE, size=16)
     cloud = s.box(1000, 90, 250, 90, "OpenAI · Anthropic ·\nOpenAI-compatible APIs", "#ffffff", BLUE, shape="ellipse", size=16)
     s.arrow([(220, 350), (330, 350)], "MCP\n+ token", start=planner, end=ab, label_dy=-26, size=14)
-    s.arrow([(120, 560), (120, 470), (330, 395)], "clone HEAD /\nfetch agent/<id>", start=repos, end=ab, both=True,
-            color=TEAL, label_at=0.25, label_dx=72, label_dy=0, size=14)
+    gh = s.box(20, 680, 200, 70, "git helper\none repo, per request", F_TEAL, TEAL, size=15)
+    s.arrow([(120, 680), (120, 640)], start=gh, end=repos, both=True, color=TEAL)
+    s.arrow([(330, 650), (220, 700)], "starts", start=la, end=gh, color=AMBER, label_dy=-14, size=14)
+    s.text("HEAD in, agent/<id> out", 120, 780, size=14, color=TEAL)
     s.arrow([(475, 410), (475, 560)], "launcher.sock\n(fixed specs only)", start=ab, end=la, label_dx=80, label_dy=0, size=14)
     s.arrow([(620, 600), (730, 565)], "create · wait\nremove", start=la, end=ag, color=AMBER, label_dy=-36, size=14)
     s.arrow([(620, 640), (730, 680)], start=la, end=ck, color=AMBER)
@@ -169,7 +171,7 @@ def lifecycle():
     xs = [110, 400, 690, 980, 1270]
     for (name, fill, stroke), x in zip(cols, xs):
         s.box(x - 85, 60, 170, 64, name, fill, stroke, size=17)
-        s._base("line", x, 124, 0, 820, points=[[0, 0], [0, 820]], strokeColor="#adb5bd", strokeWidth=1,
+        s._base("line", x, 124, 0, 950, points=[[0, 0], [0, 950]], strokeColor="#adb5bd", strokeWidth=1,
                 strokeStyle="dashed", lastCommittedPoint=None, startArrowhead=None, endArrowhead=None)
     y = 170
     P, A, L, S, M = xs
@@ -186,14 +188,16 @@ def lifecycle():
 
     msg(P, A, "1  delegate_task(spec, repo)")
     msg(A, M, "2  make sure the model is up (load / unload)", GREEN)
-    note(A, "3  shadow git dir + scratch clone\nper-task gateway socket", 260, F_PURPLE)
+    msg(A, L, "3  copy HEAD of your folder (git helper, one repo)", AMBER)
+    note(A, "   scratch clone + per-task gateway socket", 300, F_PURPLE)
     msg(A, L, "4  run agent (task id, model)", AMBER)
     msg(L, S, "5  chown -> uid 64000, start", AMBER)
     msg(S, A, "6  /v1/messages over llm.sock  (many turns)", RED, dashed=True)
     msg(A, M, "   ... forwarded to the pinned model", GREEN, dashed=True)
     msg(S, L, "7  exits (or deadline kill)", MUTED, dashed=True)
     msg(A, L, "8  remove, hand workspace back", AMBER)
-    note(A, "9  collect via shadow git\n-> branch agent/<id> in your repo", 280, F_TEAL)
+    note(A, "9  collect via shadow git", 240, F_TEAL)
+    msg(A, L, "   deliver agent/<id> to your repo (git helper)", AMBER)
     msg(A, P, "10  branch, diff, report  (untrusted data)", PURPLE, dashed=True)
     msg(P, A, "11  run_checks(branch, tests)")
     msg(A, S, "12  same sandbox, no socket: run the tests", AMBER)
@@ -205,28 +209,32 @@ def lifecycle():
 def trust():
     s = Scene()
     s.text("Trust boundaries", 630, 24, size=28)
-    s.zone(30, 70, 340, 330, "you (trusted)", Z_GREEN, GREEN)
-    pl = s.box(60, 130, 280, 90, "Claude Code planner\nreviews; never runs\nagent code on the host", F_YELLOW, AMBER, size=16)
-    rp = s.box(60, 280, 280, 80, "your repos\nonly receive a branch", F_TEAL, TEAL, size=16)
+    s.zone(30, 70, 340, 440, "you (trusted)", Z_GREEN, GREEN)
+    pl = s.box(60, 120, 280, 90, "Claude Code planner\nreviews; never runs\nagent code on the host", F_YELLOW, AMBER, size=16)
+    rp = s.box(60, 280, 280, 70, "your repo (current folder)\nonly receives a branch", F_TEAL, TEAL, size=15)
+    gh = s.box(60, 400, 280, 80, "git helper (per request)\nyour uid · one repo · no network", F_TEAL, TEAL, size=15)
+    s.arrow([(200, 400), (200, 350)], start=gh, end=rp, both=True, color=TEAL)
     s.zone(410, 70, 480, 330, "unprivileged infrastructure", Z_BLUE, BLUE)
-    ab = s.box(440, 120, 240, 100, "agentbox\nno caps · read-only\nparses model output", F_PURPLE, PURPLE, size=16)
+    ab = s.box(440, 120, 240, 100, "agentbox\nno caps · read-only\nno repos mounted", F_PURPLE, PURPLE, size=16)
     br = s.box(650, 270, 220, 100, "llm-bridge\nholds API keys\nonly remote egress", F_BLUE, BLUE, size=16)
     s.zone(930, 70, 300, 170, "privileged (root-equivalent)", Z_ORANGE, AMBER, size=16)
-    la = s.box(950, 115, 260, 100, "launcher: docker.sock\nnever sees model output\nbuilds every spec itself", F_ORANGE, AMBER, size=15)
+    la = s.box(950, 115, 260, 100, "launcher: docker.sock\nnever parses model output\nbuilds every spec itself", F_ORANGE, AMBER, size=15)
     s.zone(440, 480, 790, 220, "untrusted: the model and the code it writes", Z_RED, RED)
-    ag = s.box(470, 530, 300, 120, "agent sandbox\nno network · uid 64000 · ro\nno caps · seccomp · AppArmor", F_RED, RED, size=16)
+    ag = s.box(470, 530, 300, 120, "agent sandbox\nno network · uid 64000 · ro\nno caps · (gVisor)", F_RED, RED, size=16)
     ck = s.box(900, 530, 300, 120, "check sandbox\nruns tests on agent/<id>\nno network, no socket", F_RED, RED, size=16)
-    s.arrow([(340, 170), (440, 170)], "MCP + token", start=pl, end=ab, label_dy=-14, size=14)
-    s.arrow([(440, 205), (340, 315)], start=ab, end=rp, color=PURPLE, dashed=True)
-    s.text("branch +\nuntrusted report", 478, 262, size=14, color=PURPLE)
+    s.arrow([(340, 150), (440, 150)], "MCP + token", start=pl, end=ab, label_dy=-14, size=14)
+    s.arrow([(440, 195), (340, 195)], "untrusted\nreport + diff", start=ab, end=pl, color=PURPLE, dashed=True,
+            label_dy=30, size=14)
     s.arrow([(680, 165), (950, 165)], "fixed API", start=ab, end=la, color=AMBER, label_dy=-14, size=14)
     s.arrow([(640, 220), (720, 270)], start=ab, end=br, color=BLUE)
     s.arrow([(1080, 215), (1080, 530)], "starts", start=la, end=ck, color=AMBER, label_dx=30, label_dy=0, size=14)
     s.arrow([(1000, 215), (740, 530)], start=la, end=ag, color=AMBER)
+    s.arrow([(950, 205), (900, 440), (340, 440)], "starts (HEAD in, agent/<id> out)", start=la, end=gh,
+            color=AMBER, label_at=0.75, label_dy=-14, size=14)
     s.arrow([(560, 530), (560, 220)], start=ag, end=ab, color=RED, dashed=True)
-    s.text("Messages API only:\ntoken · pinned model\nno server-side tools", 640, 435, size=14, color=RED)
+    s.text("Messages API only:\ntoken · pinned model\nno server-side tools", 478, 330, size=14, color=RED)
     s.text("Only what crosses a boundary is shown. The agent's single channel is its gateway socket;\n"
-           "its results come back as data that you review, and test inside the sandbox.", 630, 740, size=15,
+           "its results come back as data that you review, and test inside the sandbox.", 630, 750, size=15,
            color=MUTED)
     s.save("trust-boundaries")
 
@@ -234,9 +242,10 @@ def trust():
 def collection():
     s = Scene()
     s.text("Collecting results without trusting the agent's .git", 610, 24, size=26)
-    rp = s.box(30, 120, 220, 90, "your repo\nHEAD = base", F_TEAL, TEAL)
+    rp = s.box(30, 120, 220, 90, "your repo\n(current folder)", F_TEAL, TEAL)
     sh = s.box(370, 120, 250, 90, "shadow git dir (bare)\nnever mounted anywhere", F_GREEN, GREEN, size=16)
-    s.arrow([(250, 165), (370, 165)], "fetch HEAD", start=rp, end=sh, label_dy=-14, size=14)
+    s.arrow([(250, 165), (370, 165)], "HEAD", start=rp, end=sh, label_dy=-14, size=14)
+    s.text("copied by a git helper that mounts only this repo", 200, 245, size=13, color=TEAL)
     s.zone(680, 80, 510, 290, "workspace (mounted into the sandbox)", Z_RED, RED, size=16)
     wt = s.box(720, 130, 200, 90, "files\n(the agent edits these)", F_YELLOW, AMBER, size=16)
     ag = s.box(950, 130, 210, 90, "agent's .git\nhooks · fsmonitor · config\nagent-controlled", F_GREY, MUTED, size=15)
@@ -248,7 +257,7 @@ def collection():
                 family=MONO)
     s.arrow([(820, 220), (820, 400)], "reads files only", start=wt, end=col, color=AMBER, label_dx=-70, label_dy=0, size=14)
     s.arrow([(495, 210), (495, 400)], "trusted config", start=sh, end=col, color=GREEN, label_dx=-65, label_dy=0, size=14)
-    br = s.box(30, 420, 220, 80, "branch agent/<id>\nfetched into your repo", F_TEAL, TEAL, size=16)
+    br = s.box(30, 420, 220, 80, "branch agent/<id>\ndelivered by a git helper", F_TEAL, TEAL, size=16)
     s.arrow([(300, 460), (250, 460)], start=col, end=br, color=TEAL)
     s.text("Tested: an agent planted pre-commit / post-commit / post-index-change hooks, core.hooksPath and\n"
            "core.fsmonitor. Nothing ran outside the sandbox.", 610, 580, size=15, color=MUTED)

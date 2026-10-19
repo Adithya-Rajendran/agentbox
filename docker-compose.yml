@@ -75,10 +75,10 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${AGENTBOX_DATA}/run:/run/agentbox
       - ./config:/etc/agentbox-config:ro           # dir mount: edits apply on restart
-      # read-only views, only to validate paths before handing them to the Docker daemon
+      # read-only view of agentbox's own state, to validate paths before handing them to the Docker daemon.
+      # Your repos and venvs are NOT mounted: each request mounts just the one repo/venv, briefly, into a
+      # short-lived git-helper container.
       - ${AGENTBOX_DATA}:${AGENTBOX_DATA}:ro
-      - ${AGENTBOX_REPOS_ROOT}:${AGENTBOX_REPOS_ROOT}:ro
-      - ${AGENTBOX_VENVS}:${AGENTBOX_VENVS}:ro
 
   agentbox:
     <<: *hardened
@@ -94,8 +94,7 @@ services:
       AGENTBOX_MCP_TOKEN: ${AGENTBOX_MCP_TOKEN:?set AGENTBOX_MCP_TOKEN in .env}
       AGENTBOX_HOST: 127.0.0.1
       AGENTBOX_PORT: ${AGENTBOX_PORT:-8765}
-    volumes:
-      - ${AGENTBOX_REPOS_ROOT}:${AGENTBOX_REPOS_ROOT}
+    volumes:                             # no repos: the planner passes its current folder per request
       - ${AGENTBOX_DATA}:${AGENTBOX_DATA}
       - ${AGENTBOX_DATA}/run:/run/agentbox
       - ./config:/etc/agentbox-config:ro

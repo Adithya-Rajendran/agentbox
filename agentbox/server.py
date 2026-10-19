@@ -25,11 +25,13 @@ import time
 import uuid
 from pathlib import Path
 
+import aiohttp
 import uvicorn
 from mcp.server import MCPServer
 
 from .backends import Backends, LauncherClient, LauncherError
-from .common import EXCLUDES, LOG, REPOS_ROOT, SHADOWS, SOCKETS, WORKTREES, load_registry, under
+from .common import (EXCLUDES, LOG, REPOS_ROOT, SHADOWS, SOCKETS, TID_RE, WORKTREES, host_path_ok,
+                     load_registry, under)
 from .gateway import Gateway
 
 log = logging.getLogger("agentbox")
@@ -73,6 +75,7 @@ async def _git(*args: str, **kw) -> str:
 server = MCPServer(
     name="local-agents",
     instructions=(
+        "Pass your current working directory (absolute path) as repo_path; only that repo is accessed. "
         "delegate_task runs a coding task on a model served by vLLM or Ollama on this machine (or, if configured, "
         "a remote OpenAI/Anthropic-compatible API via llm-bridge) inside a "
         "sandboxed container with no network, on an isolated clone (returned as branch agent/<id>). Use it for "
@@ -119,9 +122,11 @@ async def delegate_task(
 
     Args:
         task: Self-contained spec: goal, files involved, constraints, and how to verify (test command).
-        repo_path: Absolute path to a git repo. Work happens on an isolated clone of its HEAD commit; the
-            result comes back as branch agent/<id>.
-        model: A model id from list_models (default: nemotron-3.5-bolt).
+        repo_path: Absolute path of your current project folder (your working directory; any folder inside
+            the git repo works). Only this repo is accessed, briefly, by a git helper: its HEAD commit is
+            copied in and the result comes back as branch agent/<id>. Commit first - uncommitted changes are
+            not included.
+        model: A model id from list_models (default: the configured default_model).
         max_turns: Agent turn cap.
         timeout_minutes: Wall-clock cap for the agent run (the model may first need several minutes to load).
         python_env: Optional absolute path to a prebuilt venv (make_venv.sh), mounted read-only at /opt/venv.
@@ -134,19 +139,14 @@ async def delegate_task(
     m = REG.models.get(model)
     if not m:
         return {"error": f"unknown model {model!r}; choose from {sorted(REG.models)}"}
-    repo = Path(repo_path).resolve()
-    if not under(repo, REPOS_ROOT):
-        return {"error": f"repo_path must be inside {REPOS_ROOT} (the only directory mounted into agentbox)"}
-    rc, top, _ = await _run("git", "-C", str(repo), "rev-parse", "--show-toplevel")
-    if rc != 0:
-        return {"error": f"{repo} is not a git repo"}
-    repo = Path(top.strip())
-    base = (await _git("-C", str(repo), "rev-parse", "HEAD")).strip()
+    repo_path = os.path.normpath(repo_path) if repo_path.startswith("/") else repo_path
+    if not host_path_ok(repo_path, [REPOS_ROOT]):
+        return {"error": f"repo_path must be an absolute path inside {REPOS_ROOT} (pass your current folder)"}
     tid = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     branch, wt, shadow = f"agent/{tid}", WORKTREES / tid, SHADOWS / f"{tid}.git"
     notes: list[str] = []
     note = lambda s: (notes.append(f"{time.strftime('%H:%M:%S')} {s}"), log.info("[%s] %s", tid, s))  # noqa: E731
-    ACTIVE[tid] = {"model": model, "repo": str(repo), "started": time.time(), "phase": "queued"}
+    ACTIVE[tid] = {"model": model, "repo": repo_path, "started": time.time(), "phase": "queued"}
     gw = None
     t_start = time.time()
     try:
@@ -158,8 +158,10 @@ async def delegate_task(
             ACTIVE[tid]["phase"] = "prepare"
             WORKTREES.mkdir(parents=True, exist_ok=True)
             SHADOWS.mkdir(parents=True, exist_ok=True)
-            await _git("init", "-q", "--bare", str(shadow))
-            await _git("--git-dir", str(shadow), "fetch", "-q", "--no-tags", str(repo), f"{base}:refs/heads/base")
+            shadow.mkdir()
+            snap = await LAUNCHER.call("POST", "/repo/snapshot", {"tid": tid, "path": repo_path})
+            repo, base = snap["repo"], snap["sha"]
+            ACTIVE[tid]["repo"] = repo
             await _git("clone", "-q", "--no-hardlinks", "-b", "base", str(shadow), str(wt))
             await _git("-C", str(wt), "checkout", "-q", "-b", branch)
             await _git("-C", str(wt), "config", "core.excludesFile", "/workspace/.git/agent-excludes")
@@ -179,14 +181,11 @@ async def delegate_task(
                 "timeout_s": timeout_minutes * 60})
             res = await LAUNCHER.call("GET", f"/agents/{tid}", params={"wait": "1"})
             t_done = time.time()
-    except (LauncherError, RuntimeError) as e:
-        if gw:
-            await gw.stop()
-            try:
-                await LAUNCHER.call("DELETE", f"/agents/{tid}")
-            except LauncherError:
-                pass
-        return {"error": str(e), "task_id": tid, "notes": notes}
+    except BaseException as e:   # incl. cancellation (planner pressed Esc / client timed out)
+        await asyncio.shield(_abandon(tid, gw, wt, shadow))
+        if isinstance(e, (LauncherError, RuntimeError, OSError, aiohttp.ClientError)):
+            return {"error": str(e), "task_id": tid, "notes": notes}
+        raise
     finally:
         ACTIVE.pop(tid, None)
 
@@ -212,13 +211,13 @@ async def delegate_task(
                          env=genv)).strip()
     idx.unlink(missing_ok=True)
     await _git("--git-dir", str(shadow), "update-ref", f"refs/heads/{branch}", commit)
-    await _git("-C", str(repo), "fetch", "-q", str(shadow), f"refs/heads/{branch}:refs/heads/{branch}")
+    await LAUNCHER.call("POST", "/repo/deliver", {"tid": tid, "path": repo, "branch": branch})
     stat = await _git("--git-dir", str(shadow), "diff", "--stat", base, commit)
     diff = await _git("--git-dir", str(shadow), "diff", base, commit)
 
     u = gw.usage.as_dict()
     record = {
-        "task_id": tid, "ts": time.time(), "repo": str(repo), "branch": branch, "base": base, "model": model,
+        "task_id": tid, "ts": time.time(), "repo": repo, "branch": branch, "base": base, "model": model,
         "backend": m.backend, "exit_code": res.get("exit_code"), "status": out.get("subtype"),
         "is_error": out.get("is_error"), "num_turns": out.get("num_turns"),
         "wait_s": round(t_ready - t_start, 1), "wall_s": round(t_done - t_ready, 1),
@@ -237,9 +236,25 @@ async def delegate_task(
         "diff_stat": stat.strip(),
         "diff": diff if len(diff) <= MAX_DIFF_CHARS else diff[:MAX_DIFF_CHARS] + "\n[...truncated]",
         "notes": notes,
-        "next_steps": f"verify with run_checks(repo_path={str(repo)!r}, branch={branch!r}, command=...), then "
+        "next_steps": f"verify with run_checks(repo_path={repo!r}, branch={branch!r}, command=...), then "
                       f"`git -C {repo} merge --no-ff {branch}` and cleanup_delegation",
     }
+
+
+async def _abandon(tid: str, gw, wt: Path, shadow: Path) -> None:
+    """Best-effort cleanup of a delegation that did not finish: stop its gateway, remove its container (the
+    launcher hands the workspace back first) and delete the scratch clone and shadow git dir."""
+    if gw:
+        try:
+            await gw.stop()
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        await LAUNCHER.call("DELETE", f"/agents/{tid}")
+    except Exception:  # noqa: BLE001
+        pass
+    for p in (wt, shadow):
+        await asyncio.to_thread(shutil.rmtree, p, True)
 
 
 @server.tool()
@@ -257,23 +272,20 @@ async def run_checks(repo_path: str, branch: str, command: str, python_env: str 
 
     Returns: exit_code, passed, timed_out, duration, and the tail of stdout/stderr (untrusted output).
     """
-    repo = Path(repo_path).resolve()
-    if not under(repo, REPOS_ROOT):
-        return {"error": f"repo_path must be inside {REPOS_ROOT}"}
+    repo_path = os.path.normpath(repo_path) if repo_path.startswith("/") else repo_path
+    if not host_path_ok(repo_path, [REPOS_ROOT]):
+        return {"error": f"repo_path must be an absolute path inside {REPOS_ROOT}"}
     if branch.startswith("-") or not branch.strip():
         return {"error": "bad branch"}
-    rc, sha, err = await _run("git", *SAFE_GIT, "-C", str(repo), "rev-parse", "--verify", "--quiet",
-                              f"{branch}^{{commit}}")
-    if rc != 0:
-        return {"error": f"{branch!r} is not a commit in {repo}"}
-    sha = sha.strip()
     cid = "chk-" + time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     wt, shadow = WORKTREES / cid, SHADOWS / f"{cid}.git"
     t0 = time.time()
+    sha = None
     try:
-        await _git("init", "-q", "--bare", str(shadow))
-        await _git("--git-dir", str(shadow), "fetch", "-q", "--no-tags", str(repo), f"{sha}:refs/heads/check")
-        await _git("clone", "-q", "--no-hardlinks", "-b", "check", str(shadow), str(wt))
+        shadow.mkdir(parents=True)
+        snap = await LAUNCHER.call("POST", "/repo/snapshot", {"tid": cid, "path": repo_path, "ref": branch})
+        sha = snap["sha"]
+        await _git("clone", "-q", "--no-hardlinks", "-b", "base", str(shadow), str(wt))
         await _git("-C", str(wt), "remote", "remove", "origin")
         await LAUNCHER.call("POST", "/checks", {"tid": cid, "command": command, "venv": python_env,
                                                 "timeout_s": min(timeout_minutes, 60) * 60})
@@ -300,22 +312,29 @@ async def run_checks(repo_path: str, branch: str, command: str, python_env: str 
 
 @server.tool()
 async def cleanup_delegation(repo_path: str, branch: str) -> dict:
-    """Delete a delegation's scratch clone, shadow git dir and `agent/<id>` branch (after merging or discarding)."""
+    """Delete a delegation's scratch clone, shadow git dir and its `agent/<id>` branch (after merging or
+    discarding). Only agent/<id> branches can be deleted."""
     tid = branch.removeprefix("agent/")
+    if not (branch.startswith("agent/") and TID_RE.match(tid)):
+        return {"error": "branch must be agent/<id>"}
+    repo_path = os.path.normpath(repo_path) if repo_path.startswith("/") else repo_path
+    if not host_path_ok(repo_path, [REPOS_ROOT]):
+        return {"error": f"repo_path must be an absolute path inside {REPOS_ROOT}"}
     try:
         await LAUNCHER.call("DELETE", f"/agents/{tid}")   # also hands the workspace back to agentbox's uid
     except LauncherError:
         pass
-    paths = [WORKTREES / tid, SHADOWS / f"{tid}.git"]
-    if not all(under(p.resolve(), root) for p, root in zip(paths, (WORKTREES, SHADOWS))):
-        return {"error": "bad branch name"}
-    for p in paths:
-        shutil.rmtree(p, ignore_errors=True)
-    repo = Path(repo_path).resolve()
-    if not under(repo, REPOS_ROOT):
-        return {"error": f"repo_path must be inside {REPOS_ROOT}"}
-    rc, _, e = await _run("git", "-C", str(repo), "branch", "-D", branch)
-    return {"scratch_removed": not paths[0].exists(), "branch_deleted": rc == 0, "errors": e.strip()}
+    for p in (WORKTREES / tid, SHADOWS / f"{tid}.git"):
+        if p.is_symlink():
+            p.unlink()
+        else:
+            shutil.rmtree(p, ignore_errors=True)
+    try:
+        res = await LAUNCHER.call("POST", "/repo/delete-branch", {"path": repo_path, "branch": branch})
+    except LauncherError as e:
+        res = {"deleted": False, "error": str(e)}
+    return {"scratch_removed": not (WORKTREES / tid).exists(), "branch_deleted": res.get("deleted"),
+            "errors": res.get("error", "")}
 
 
 class BearerAuth:

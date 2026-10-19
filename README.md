@@ -6,8 +6,12 @@ back as a git branch for review.
 
 ![agentbox components](docs/diagrams/architecture.svg)
 
-- **One MCP tool, `delegate_task`.** Give it a spec and a repo path. A local model runs Claude Code
-  headless on a scratch clone, and you get back the branch `agent/<id>`, the diff, and the agent's report.
+- **One MCP tool, `delegate_task`.** Claude passes a spec and **its current folder**. A local model runs
+  Claude Code headless on a scratch copy of that repo's `HEAD`, and you get back the branch `agent/<id>`,
+  the diff, and the agent's report.
+- **Only the folder you're in is touched.** None of your projects are mounted into agentbox. Each request
+  mounts just that one repo, for seconds, in a git helper that runs as you, with no network. The helper
+  copies `HEAD` in or writes `agent/<id>` back, and refuses anything that isn't a git repo you own.
 - **Hardened by construction.** Each agent gets:
   - no network interface (`--network none`), so it can't install packages, call home, or exfiltrate code;
   - a read-only root filesystem and zero capabilities;
@@ -67,7 +71,7 @@ delegate_task, and review the branch it returns."*
 
 | Tool | What it does |
 |---|---|
-| `delegate_task(task, repo_path, model?, max_turns, timeout_minutes, python_env?, …)` | Runs the task in a sandbox. Returns the branch, status, report, diff, token usage and timings. |
+| `delegate_task(task, repo_path, model?, max_turns, timeout_minutes, python_env?, …)` | Runs the task in a sandbox. `repo_path` is Claude's current folder. Returns the branch, status, report, diff, token usage and timings. |
 | `run_checks(repo_path, branch, command, python_env?)` | Runs a verification command on a branch inside the sandbox. Returns pass/fail plus the output tail. |
 | `list_models()` | Lists configured models, what's loaded now, and active tasks. |
 | `cleanup_delegation(repo_path, branch)` | Removes a task's scratch clone, shadow git dir and branch. |

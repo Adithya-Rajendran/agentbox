@@ -20,7 +20,7 @@ if [ ! -f .env ]; then
       -e "s|^AGENTBOX_GID=.*|AGENTBOX_GID=$(id -g)|" \
       -e "s|^DOCKER_GID=.*|DOCKER_GID=$(getent group docker | cut -d: -f3)|" \
       -e "s|^AGENTBOX_DATA=.*|AGENTBOX_DATA=$DATA|" \
-      -e "s|^AGENTBOX_REPOS_ROOT=.*|AGENTBOX_REPOS_ROOT=${AGENTBOX_REPOS_ROOT:-$HOME/Projects}|" \
+      -e "s|^AGENTBOX_REPOS_ROOT=.*|AGENTBOX_REPOS_ROOT=$(realpath "${AGENTBOX_REPOS_ROOT:-$HOME}")|" \
       -e "s|^AGENTBOX_VENVS=.*|AGENTBOX_VENVS=${AGENTBOX_VENVS:-$HOME/.cache/local-agent-venvs}|" \
       -e "s|^OLLAMA_MODELS_DIR=.*|OLLAMA_MODELS_DIR=${OLLAMA_MODELS_DIR:-$DATA/ollama}|" \
       -e "s|^AGENTBOX_MCP_TOKEN=.*|AGENTBOX_MCP_TOKEN=$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')|" \
