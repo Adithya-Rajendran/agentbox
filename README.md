@@ -4,14 +4,7 @@
 on your own GPU does the hands-on work inside a hardened, network-less container, and hands the result
 back as a git branch for review.
 
-```
-Claude Code (Opus / Fable plans) ──MCP──▶ agentbox ──▶ agent container (Claude Code + local model)
-                                                       no network · read-only · no caps · uid 64000
-                                                                │ one unix socket
-                                                                ▼
-                                    vLLM / Ollama on your GPU   ·   llm-bridge ──▶ OpenAI / Anthropic / any
-                                                                    (keys live here)   OpenAI-compatible API
-```
+![agentbox components](docs/diagrams/architecture.svg)
 
 - **One MCP tool, `delegate_task`.** Give it a spec and a repo path. A local model runs Claude Code
   headless on a scratch clone, and you get back the branch `agent/<id>`, the diff, and the agent's report.
@@ -78,14 +71,32 @@ The same calls are available from the command line: `uv run --script cli.py mode
 
 ## Documentation
 
-See the **[wiki](https://github.com/Adithya-Rajendran/agentbox/wiki)**:
-[Architecture](https://github.com/Adithya-Rajendran/agentbox/wiki/Architecture) ·
-[Security model](https://github.com/Adithya-Rajendran/agentbox/wiki/Security-Model) ·
-[Installation](https://github.com/Adithya-Rajendran/agentbox/wiki/Installation) ·
-[Configuration](https://github.com/Adithya-Rajendran/agentbox/wiki/Configuration) ·
-[Using with Claude Code](https://github.com/Adithya-Rajendran/agentbox/wiki/Using-with-Claude-Code) ·
-[Writing good specs](https://github.com/Adithya-Rajendran/agentbox/wiki/Writing-Good-Specs) ·
-[Troubleshooting](https://github.com/Adithya-Rajendran/agentbox/wiki/Troubleshooting)
+The **[wiki](https://github.com/Adithya-Rajendran/agentbox/wiki)** follows the Diátaxis structure:
+
+- **Tutorial:** [Your first delegation](https://github.com/Adithya-Rajendran/agentbox/wiki/Your-First-Delegation)
+- **How-to guides:**
+  - [Install](https://github.com/Adithya-Rajendran/agentbox/wiki/Installation)
+  - [Delegate from Claude Code](https://github.com/Adithya-Rajendran/agentbox/wiki/Delegate-Work-from-Claude-Code)
+  - [Write good specs](https://github.com/Adithya-Rajendran/agentbox/wiki/Writing-Good-Specs)
+  - [Add a local model](https://github.com/Adithya-Rajendran/agentbox/wiki/Add-a-Local-Model)
+  - [Connect OpenAI and other remote APIs](https://github.com/Adithya-Rajendran/agentbox/wiki/Connect-OpenAI-and-Other-Remote-APIs)
+  - [Run agents under gVisor](https://github.com/Adithya-Rajendran/agentbox/wiki/Run-Agents-under-gVisor)
+  - [Troubleshoot](https://github.com/Adithya-Rajendran/agentbox/wiki/Troubleshooting)
+- **Reference:**
+  - [MCP tools](https://github.com/Adithya-Rajendran/agentbox/wiki/MCP-Tools)
+  - [Configuration](https://github.com/Adithya-Rajendran/agentbox/wiki/Configuration)
+  - [Sandbox specification](https://github.com/Adithya-Rajendran/agentbox/wiki/Sandbox-Specification)
+  - [Internal APIs](https://github.com/Adithya-Rajendran/agentbox/wiki/Internal-APIs)
+- **Explanation:**
+  - [How agentbox works](https://github.com/Adithya-Rajendran/agentbox/wiki/How-agentbox-Works)
+  - [Security model](https://github.com/Adithya-Rajendran/agentbox/wiki/Security-Model)
+  - [How a network-less agent reaches a model](https://github.com/Adithya-Rajendran/agentbox/wiki/How-a-Network-less-Agent-Reaches-a-Model)
+  - [Collecting results safely](https://github.com/Adithya-Rajendran/agentbox/wiki/Result-Collection)
+  - [Remote models and llm-bridge](https://github.com/Adithya-Rajendran/agentbox/wiki/Remote-Models-and-llm-bridge)
+  - [Design decisions](https://github.com/Adithya-Rajendran/agentbox/wiki/Design-Decisions)
+
+Diagrams are Excalidraw sources in [`docs/diagrams/`](docs/diagrams). Open any `.excalidraw` file on
+[excalidraw.com](https://excalidraw.com) to edit it, then re-render with `docs/diagrams/render.sh`.
 
 ## Status
 
