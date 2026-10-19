@@ -36,8 +36,9 @@ EOF
 ( for _ in $(seq 1800); do
     n=$(docker ps --format '{{.Names}}' | grep -m1 '^agentbox-agent-' || true)
     if [ -n "$n" ]; then
-      docker inspect "$n" --format 'net={{.HostConfig.NetworkMode}} ro={{.HostConfig.ReadonlyRootfs}} caps={{.HostConfig.CapDrop}}+{{.HostConfig.CapAdd}} sec={{.HostConfig.SecurityOpt}} user={{.Config.User}} mounts={{len .Mounts}}' > "$TMP/inspect"
-      docker exec "$n" sh -c 'ls /sys/class/net | tr "\n" " "; id -u' > "$TMP/inside" 2>&1 || true
+      docker inspect "$n" --format 'net={{.HostConfig.NetworkMode}} ro={{.HostConfig.ReadonlyRootfs}} caps={{.HostConfig.CapDrop}}+{{.HostConfig.CapAdd}} sec={{.HostConfig.SecurityOpt}} user={{.Config.User}} mounts={{len .Mounts}} runtime={{.HostConfig.Runtime}}' > "$TMP/inspect"
+      # interfaces from /proc/net/dev (works under runc and gVisor, which has no /sys/class/net)
+      docker exec "$n" sh -c 'awk -F: "NR>2{gsub(/ /,\"\",\$1); printf \"%s \", \$1}" /proc/net/dev; id -u' > "$TMP/inside" 2>&1 || true
       exit 0
     fi
     sleep 1
@@ -56,10 +57,10 @@ try:
     calc.mean([]); raise SystemExit(\"no ValueError\")
 except ValueError as e:
     assert str(e) == \"mean of empty list\", e
-print(\"CHECK-OK\")" && echo "uid=$(id -u) net=$(ls /sys/class/net | tr -d "\n")"' > "$TMP/check.json" || true
-python3 - "$TMP" "$AGENTBOX_AGENT_UID" <<'PY'
+print(\"CHECK-OK\")" && echo "uid=$(id -u) net=[$(awk -F: "NR>2{gsub(/ /,\"\",\$1); printf \"%s \", \$1}" /proc/net/dev)]"' > "$TMP/check.json" || true
+python3 - "$TMP" "$AGENTBOX_AGENT_UID" "${AGENTBOX_AGENT_RUNTIME:-}" <<'PY'
 import json, sys, pathlib
-tmp, agent_uid = pathlib.Path(sys.argv[1]), sys.argv[2]
+tmp, agent_uid, want_rt = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 r = json.loads((tmp / "out.json").read_text())
 ins = (tmp / "inspect").read_text().strip() if (tmp / "inspect").exists() else ""
 inside = (tmp / "inside").read_text().split() if (tmp / "inside").exists() else []
@@ -77,10 +78,15 @@ checks = {
 }
 chk = json.loads((tmp / "check.json").read_text() or "{}") if (tmp / "check.json").exists() else {}
 checks["run_checks passes in sandbox"] = chk.get("passed") is True and "CHECK-OK" in chk.get("stdout_tail", "")
-checks[f"run_checks sandbox: uid {agent_uid}, only lo"] = f"uid={agent_uid} net=lo" in chk.get("stdout_tail", "")
+checks[f"run_checks sandbox: uid {agent_uid}, only lo"] = f"uid={agent_uid} net=[lo ]" in chk.get("stdout_tail", "")
+rt = ins.split("runtime=")[-1].strip() if "runtime=" in ins else ""
+if want_rt:
+    checks[f"sandbox runtime is {want_rt}"] = rt == want_rt
 for k, v in checks.items():
     print(f"  {'PASS' if v else 'FAIL'}  {k}")
 print(f"  ({r.get('wall_seconds')}s agent, {r.get('wait_seconds')}s wait, usage {r.get('usage')})")
+if not want_rt:
+    print("  NOTE  sandboxes use runc (shared host kernel); gVisor is recommended: set AGENTBOX_AGENT_RUNTIME=runsc")
 if not all(checks.values()):
     print(json.dumps(r, indent=1)[:3000]); sys.exit(1)
 print("SMOKE TEST PASSED")

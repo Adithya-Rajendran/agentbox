@@ -56,7 +56,8 @@ class Backends:
                 ollama = [m["name"] for m in (await r.json()).get("models", [])]
         except Exception as e:  # noqa: BLE001
             ollama = f"unreachable: {e}"
-        return {"containers": st["containers"], "ollama_loaded": ollama}
+        return {"containers": st["containers"], "ollama_loaded": ollama,
+                "sandbox_runtime": st.get("sandbox_runtime")}
 
     async def _ollama_unload_all(self) -> None:
         try:

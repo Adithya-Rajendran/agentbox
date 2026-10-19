@@ -34,7 +34,8 @@ log = logging.getLogger("agentbox.launcher")
 DOCKER_SOCK = os.environ.get("DOCKER_SOCK", "/var/run/docker.sock")
 MAX_TIMEOUT_S = 4 * 3600
 ENV_ALLOW = {"ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "AGENT_NO_GUIDE", "MAX_THINKING_TOKENS"}
-AGENT_RUNTIME = os.environ.get("AGENTBOX_AGENT_RUNTIME") or None   # e.g. runsc (gVisor) if installed
+AGENT_RUNTIME = os.environ.get("AGENTBOX_AGENT_RUNTIME") or None   # runsc (gVisor) recommended; None = runc
+GVISOR_DOCS = "https://github.com/Adithya-Rajendran/agentbox/wiki/Run-Agents-under-gVisor"
 AGENT_LIMITS = {
     "memory": int(os.environ.get("AGENTBOX_AGENT_MEM_GB", "8")) << 30,
     "cpus": float(os.environ.get("AGENTBOX_AGENT_CPUS", "4")),
@@ -139,7 +140,8 @@ class Launcher:
             "Env": env_list + ["PYTHONDONTWRITEBYTECODE=1"],
             "User": f"{uid}:{gid}",
             "WorkingDir": "/workspace",
-            "NetworkDisabled": True,
+            # NetworkMode none (below) gives a private namespace with only lo. Not NetworkDisabled: under gVisor
+            # that removes lo too, which breaks the agent's 127.0.0.1 relay and tests that use localhost.
             "Labels": {LABEL: role, "agentbox.tid": tid, **labels},
             "HostConfig": {
                 "NetworkMode": "none",            # no interface but lo
@@ -255,7 +257,9 @@ class Launcher:
             "HostConfig": {"NetworkMode": "none", "ReadonlyRootfs": True, "CapDrop": ["ALL"],
                            "CapAdd": ["CHOWN", "DAC_OVERRIDE", "FOWNER"],
                            "SecurityOpt": ["no-new-privileges:true"], "PidsLimit": 16,
-                           "Binds": [f"{ws}:/w:rw"], **({"Runtime": AGENT_RUNTIME} if AGENT_RUNTIME else {})},
+                           # Always runc: this fixed command executes no untrusted code (chown -h never
+                           # follows links), and gVisor's own threads would not fit its tiny pids limit.
+                           "Binds": [f"{ws}:/w:rw"]},
         }
         await self.docker.remove(name)
         await self.docker.req("POST", "/containers/create", spec, params={"name": name})
@@ -323,8 +327,25 @@ class Launcher:
             await self._stop_vllm_except(None, await self.busy_models())
         return web.json_response({"stopped": True})
 
+    async def check_runtime(self) -> None:
+        """Fail fast on a sandbox runtime that would break agents; recommend gVisor when none is set."""
+        runtimes = (await self.docker.req("GET", "/info")).get("Runtimes") or {}
+        if not AGENT_RUNTIME:
+            log.warning("sandboxes use the default runtime (runc, shared host kernel). gVisor is recommended: "
+                        "install runsc and set AGENTBOX_AGENT_RUNTIME=runsc - %s", GVISOR_DOCS)
+            return
+        if AGENT_RUNTIME not in runtimes:
+            raise SystemExit(f"AGENTBOX_AGENT_RUNTIME={AGENT_RUNTIME} is not a Docker runtime here "
+                             f"(have: {', '.join(runtimes)}). Install it or unset the variable. {GVISOR_DOCS}")
+        args = runtimes[AGENT_RUNTIME].get("runtimeArgs") or []
+        if AGENT_RUNTIME == "runsc" and not any(a in ("--host-uds=open", "--host-uds=all") for a in args):
+            raise SystemExit("runsc is registered without --host-uds=open, so agents could not reach their model "
+                             "socket. Fix: sudo runsc install -- --host-uds=open && sudo systemctl reload docker")
+        log.info("sandbox runtime: %s %s", AGENT_RUNTIME, " ".join(args))
+
     async def status(self, req: web.Request) -> web.Response:
-        return web.json_response({"containers": await self.running(), "ts": time.time()})
+        return web.json_response({"containers": await self.running(), "ts": time.time(),
+                                  "sandbox_runtime": AGENT_RUNTIME or "runc (default; gVisor recommended)"})
 
 
 def _bytes(s: str) -> int:
@@ -336,6 +357,7 @@ def _bytes(s: str) -> int:
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     lz = Launcher()
+    await lz.check_runtime()
     app = web.Application()
     app.add_routes([
         web.post("/agents", lz.start_agent), web.post("/checks", lz.start_check),

@@ -12,7 +12,8 @@ back as a git branch for review.
   - no network interface (`--network none`), so it can't install packages, call home, or exfiltrate code;
   - a read-only root filesystem and zero capabilities;
   - a uid that doesn't exist on the host;
-  - a per-task gateway that pins the model and meters tokens.
+  - a per-task gateway that pins the model and meters tokens;
+  - optionally (recommended) gVisor's user-space kernel instead of the host's.
   
   Only a tiny launcher holds the Docker socket, and it builds every container spec itself.
 - **Safe result collection.** agentbox never runs git inside the agent's `.git` (which the agent controls,
@@ -36,6 +37,10 @@ back as a git branch for review.
 - An NVIDIA GPU with the NVIDIA Container Toolkit. Developed on an NVIDIA GB10 (128 GB unified
   memory); the shipped model configs target that class of machine.
 - [`uv`](https://docs.astral.sh/uv/) for the CLI, and [Claude Code](https://claude.com/claude-code) as the planner
+- **Recommended:** [gVisor](https://gvisor.dev) (`runsc`), so agents get their own user-space kernel instead
+  of sharing the host's. It's optional. `scripts/setup.sh` turns it on automatically when it detects
+  `runsc` registered with `--host-uds=open`; see
+  [Run agents under gVisor](https://github.com/Adithya-Rajendran/agentbox/wiki/Run-Agents-under-gVisor).
 
 ## Quick start
 
